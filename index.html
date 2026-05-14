@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vanilla Hentai List</title>
+    <link rel="icon" type="image/png" href="favicon.png">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -34,6 +35,15 @@
             <option value="title_asc">Title: A-Z</option>
             <option value="title_desc">Title: Z-A</option>
         </select>
+        <button class="random-btn" onclick="randomAnime()" title="Jump to a random anime from current results">🎲 Random</button>
+        <span id="resultCount" class="result-count"></span>
+    </div>
+
+    <div class="category-row">
+        <button class="cat-btn active" data-cat="all" onclick="setCategory('all')">🌐 All</button>
+        <button class="cat-btn" data-cat="vanilla" onclick="setCategory('vanilla')">💚 Vanilla</button>
+        <button class="cat-btn" data-cat="neutral" onclick="setCategory('neutral')">🟡 Neutral</button>
+        <button class="cat-btn" data-cat="avoid" onclick="setCategory('avoid')">🔴 Avoid</button>
     </div>
 
     <div class="advanced-toggle" onclick="toggleAdvanced()">⚙️ Advanced Filters & Sorting ▼</div>
@@ -59,7 +69,12 @@
 
 <div class="grid" id="anime-grid"></div>
 
-<script src="data.js"></script>
+<button id="scrollTopBtn" class="scroll-top-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top">↑</button>
+<div class="last-updated">Last updated: 13 May 2026</div>
+
+<script src="data-vanilla.js"></script>
+<script src="data-neutral.js"></script>
+<script src="data-avoid.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
