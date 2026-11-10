@@ -21,3 +21,20 @@ jobs:
       - run: npm run check
       - name: Run browser tests with the runner's installed Chrome
         run: BROWSER_PATH="$(command -v google-chrome)" npm test
+  chrome56:
+    name: Chromium 56
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run setup:chrome56
+      - name: Test the actual archived browser under Xvfb
+        run: xvfb-run -a npm run test:chrome56
+        env:
+          CHROME56_PATH: /tmp/vanilla-list-chrome56/chrome-linux/chrome
+          LD_LIBRARY_PATH: /tmp/vanilla-list-chrome56/libs/usr/lib/x86_64-linux-gnu

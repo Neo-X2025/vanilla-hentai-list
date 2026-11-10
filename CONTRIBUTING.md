@@ -42,7 +42,14 @@ edits separate from code changes when practical.
 ## Code changes
 
 Use the existing four-space JavaScript indentation. Keep the site deployable as
-static files. Add regression coverage for behavior changes, particularly request
+static files and preserve Chrome 56 support in all shipped JavaScript, HTML,
+and CSS. Node-based tooling can use newer syntax. The compatibility guard checks
+the browser files separately; do not add unguarded modern browser APIs, CSS Grid,
+flex gaps, or other features newer than this baseline. Keep fallbacks covered by
+tests. The archived-browser CI job runs Chromium 56 itself; setup and invocation
+are documented in the README.
+
+Add regression coverage for behavior changes, particularly request
 batching, cache invalidation, rate limits, and stale asynchronous callbacks.
 Use synthetic entries in tests, and keep live-provider checks out of normal CI.
 

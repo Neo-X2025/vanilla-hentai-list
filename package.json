@@ -13,11 +13,16 @@
   },
   "scripts": {
     "start": "node scripts/serve.cjs",
-    "check": "node --check app.js && node scripts/validate-data.cjs",
+    "check": "node scripts/check-compat.cjs && node scripts/validate-data.cjs",
     "test": "node --test tests/*.test.cjs",
-    "test:live": "node scripts/smoke-api.cjs"
+    "test:live": "node scripts/smoke-api.cjs",
+    "setup:chrome56": "node scripts/setup-chrome56.cjs",
+    "test:chrome56": "node scripts/test-chrome56.cjs"
   },
   "devDependencies": {
-    "playwright": "1.63.0"
+    "@mdn/browser-compat-data": "8.1.8",
+    "acorn": "8.19.0",
+    "playwright": "1.63.0",
+    "postcss": "8.5.32"
   }
 }
