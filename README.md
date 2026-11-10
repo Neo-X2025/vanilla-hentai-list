@@ -38,7 +38,8 @@ npm test
 ```
 
 If Chromium is already installed, use `BROWSER_PATH=/path/to/chromium npm test`.
-Linux CI may need `npx playwright install --with-deps chromium` instead.
+Minimal Linux systems may need `npx playwright install --with-deps chromium`
+instead. GitHub Actions uses Chrome already installed on its Ubuntu runner.
 
 Tests run the real page in headless Chromium with synthetic entries and stubbed
 API/image responses. They cover filtering, reset, keyboard controls, clipboard

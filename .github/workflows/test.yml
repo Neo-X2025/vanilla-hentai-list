@@ -18,5 +18,5 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: npm test
+      - name: Run browser tests with the runner's installed Chrome
+        run: BROWSER_PATH="$(command -v google-chrome)" npm test
