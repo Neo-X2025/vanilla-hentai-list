@@ -7,21 +7,62 @@ const animeData = [
     ...avoidEntries.map(e  => ({ title: e[0], note: e[1], tags: e[2], score: e[3], category: "avoid"   })),
 ];
 
+// Chrome 56 has Fetch but no AbortController. Use XHR there so cancelling a
+// filter change or timing out a request still stops the underlying network I/O.
+function createCoverRequest(body) {
+    const native = typeof AbortController === "function" ? new AbortController() : null;
+    const control = {
+        signal: native ? native.signal : { aborted: false },
+        xhr: null,
+        abort() {
+            if (native) native.abort();
+            else this.signal.aborted = true;
+            if (this.xhr) this.xhr.abort();
+        },
+    };
+    if (native && typeof fetch === "function") {
+        control.promise = Promise.resolve().then(() => fetch("https://graphql.anilist.co", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            credentials: "omit",
+            body,
+            signal: native.signal,
+        }));
+    } else {
+        control.promise = new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            control.xhr = xhr;
+            xhr.open("POST", "https://graphql.anilist.co", true);
+            xhr.setRequestHeader("Content-Type", "application/json");
+            xhr.setRequestHeader("Accept", "application/json");
+            xhr.onload = () => resolve({
+                status: xhr.status,
+                ok: xhr.status >= 200 && xhr.status < 300,
+                headers: { get: name => xhr.getResponseHeader(name) },
+                json: () => Promise.resolve().then(() => JSON.parse(xhr.responseText)),
+            });
+            xhr.onerror = () => reject(new Error("Network error"));
+            xhr.onabort = () => reject(new Error("Request aborted"));
+            xhr.send(body);
+        });
+    }
+    return control;
+}
+
+// Chrome 51–57 implements intersectionRatio without isIntersecting.
+function isVisibleIntersection(entry) {
+    return typeof entry.isIntersecting === "boolean" ? entry.isIntersecting : entry.intersectionRatio > 0;
+}
+
+function scrollToTop() {
+    if ("scrollBehavior" in document.documentElement.style) window.scrollTo({ top: 0, behavior: "smooth" });
+    else window.scrollTo(0, 0);
+}
+
 // =============================================================================
 // IMAGE LOADER
 // =============================================================================
 class ImageLoader {
-    // Ten searches share one request; stay below AniList's current 30 requests/minute.
-    static MIN_INTERVAL = 2100;
-    static BATCH_SIZE = 10;
-    static RATE_LIMIT_PAUSE = 60000;
-    static CACHE_KEY = 'vanilla-list:anilist-covers:v1';
-    static CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
-    static CACHE_LIMIT = 500;
-    static ERROR_PAUSE = 1000;
-    static REQUEST_TIMEOUT = 10000;
-    static IMAGE_TIMEOUT = 15000;
-    static MAX_RETRIES = 2;
 
     constructor() {
         this._cache = new Map();
@@ -45,8 +86,8 @@ class ImageLoader {
         this._gen++;
         clearTimeout(this._timer);
         cancelAnimationFrame(this._frame);
-        this._controller?.abort();
-        this._observer?.disconnect();
+        if (this._controller) this._controller.abort();
+        if (this._observer) this._observer.disconnect();
         for (const timer of this._imageTimers.values()) clearTimeout(timer);
         this._imageTimers.clear();
         this._timer = this._frame = this._controller = this._observer = null;
@@ -70,7 +111,7 @@ class ImageLoader {
             const observer = new IntersectionObserver(entries => {
                 if (this._gen !== gen) return;
                 for (const entry of entries) {
-                    if (!entry.isIntersecting) continue;
+                    if (!isVisibleIntersection(entry)) continue;
                     this._enqueue(Number(entry.target.dataset.index));
                     observer.unobserve(entry.target);
                 }
@@ -89,11 +130,11 @@ class ImageLoader {
             for (const record of records.slice(-ImageLoader.CACHE_LIMIT)) {
                 if (!Array.isArray(record) || record.length !== 2) continue;
                 const [title, value] = record;
-                if (typeof title === "string" && typeof value?.url === "string"
+                if (typeof title === "string" && value && typeof value.url === "string"
                     && value.url.startsWith("https://") && Number.isFinite(value.expires)
                     && value.expires > Date.now()) this._cache.set(title, value);
             }
-        } catch { /* Storage may be blocked, full, or contain invalid JSON. */ }
+        } catch (error) { /* Storage may be blocked, full, or contain invalid JSON. */ }
     }
 
     _saveCache() {
@@ -101,19 +142,19 @@ class ImageLoader {
             localStorage.setItem(ImageLoader.CACHE_KEY, JSON.stringify(
                 [...this._cache].filter(([, value]) => value.url.startsWith("https://"))
             ));
-        } catch { /* In-memory caching still works when storage is unavailable. */ }
+        } catch (error) { /* In-memory caching still works when storage is unavailable. */ }
     }
 
     _cachedImage(title) {
         const cached = this._cache.get(title);
-        if (cached?.expires > Date.now()) return cached.url;
+        if (cached && cached.expires > Date.now()) return cached.url;
         this._cache.delete(title);
         return null;
     }
 
     _enqueue(index) {
         if (this._states[index] !== "idle") return;
-        const cached = this._cachedImage(this._data[index]?.title);
+        const cached = this._cachedImage((this._data[index] || {}).title);
         if (cached) {
             this._applyImage(index, cached);
             return;
@@ -156,33 +197,36 @@ class ImageLoader {
         while (this._queue.length && jobs.length < ImageLoader.BATCH_SIZE) {
             const job = this._queue.shift();
             if (this._states[job.index] !== "queued") continue;
-            const title = this._data[job.index]?.title;
+            const title = (this._data[job.index] || {}).title;
             const cached = this._cachedImage(title);
             if (cached) { this._applyImage(job.index, cached, job.retries); continue; }
             const query = this._normalizeTitle(title || "");
             if (!query) { this._fail(job.index, "No cover found"); continue; }
             this._states[job.index] = "loading";
             this._setSpinner(job.index, "Loading…");
-            jobs.push({ ...job, title, query });
+            jobs.push(Object.assign({}, job, { title, query }));
         }
         if (!jobs.length) { this._kick(); return; }
         const gen = this._gen;
         this._inFlight = true;
-        this._fetchBatch(jobs).catch(() => {
-            if (this._gen === gen) jobs.forEach(job => this._retry(job.index, job.retries, "Cover unavailable"));
-        }).finally(() => {
+        const finished = () => {
             if (this._gen !== gen) return;
             this._inFlight = false;
             this._kick();
-        });
+        };
+        this._fetchBatch(jobs).catch(() => {
+            if (this._gen === gen) jobs.forEach(job => this._retry(job.index, job.retries, "Cover unavailable"));
+        }).then(finished, finished);
     }
 
     _normalizeTitle(title) {
-        return title.normalize("NFKC").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+        // Separate punctuation without Unicode property escapes (Chrome 64+).
+        // Keep accented, Japanese, and other non-ASCII title characters intact.
+        return title.normalize("NFKC").replace(/[\u0000-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u00BF\u2000-\u206F\u2600-\u27BF\u3000-\u303F\u30FB]+/g, " ").replace(/\s+/g, " ").trim();
     }
 
     _rateLimitDelay(headers) {
-        const raw = headers.get("Retry-After")?.trim();
+        const raw = (headers.get("Retry-After") || "").trim();
         const seconds = raw ? Number(raw) : NaN;
         const retryAfter = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Date.parse(raw) - Date.now();
         const reset = Number(headers.get("X-RateLimit-Reset")) * 1000 - Date.now();
@@ -200,21 +244,16 @@ class ImageLoader {
                     coverImage { large medium }
                 }
             }`).join("\n");
-        const variables = Object.fromEntries(jobs.map((job, i) => [`q${i}`, job.query]));
-        const controller = new AbortController();
+        const variables = {};
+        jobs.forEach((job, i) => { variables[`q${i}`] = job.query; });
+        const controller = createCoverRequest(JSON.stringify({ query: `query (${definitions}) { ${fields} }`, variables }));
         const gen = this._gen;
         this._controller = controller;
         this._lastFetch = Date.now();
         const timeout = setTimeout(() => controller.abort(), ImageLoader.REQUEST_TIMEOUT);
         let response;
         try {
-            response = await fetch("https://graphql.anilist.co", {
-                method: "POST",
-                headers: { "Content-Type": "application/json", Accept: "application/json" },
-                credentials: "omit",
-                body: JSON.stringify({ query: `query (${definitions}) { ${fields} }`, variables }),
-                signal: controller.signal,
-            });
+            response = await controller.promise;
             if (this._gen !== gen) return;
             const limit = Number(response.headers.get("X-RateLimit-Limit"));
             if (Number.isFinite(limit) && limit >= 1) this._serverInterval = Math.ceil(60000 / limit) + 100;
@@ -235,22 +274,23 @@ class ImageLoader {
             }
             const json = await response.json();
             if (this._gen !== gen) return;
-            const errors = Array.isArray(json?.errors) ? json.errors : [];
+            const errors = json && Array.isArray(json.errors) ? json.errors : [];
             jobs.forEach((job, i) => {
                 const alias = `c${i}`;
-                const error = errors.find(err => err?.path?.[0] === alias) || errors.find(err => !err?.path?.length);
-                const media = json?.data?.[alias]?.media;
+                const error = errors.find(err => err && err.path && err.path[0] === alias) || errors.find(err => err && (!err.path || !err.path.length));
+                const media = json && json.data && json.data[alias] ? json.data[alias].media : null;
                 const candidates = Array.isArray(media) ? media : [];
                 const normalized = this._normalizeTitle(job.title).toLowerCase();
                 const exact = candidates.find(entry => [
-                    ...Object.values(entry?.title || {}), ...(Array.isArray(entry?.synonyms) ? entry.synonyms : [])
+                    ...Object.values(entry && entry.title || {}), ...(entry && Array.isArray(entry.synonyms) ? entry.synonyms : [])
                 ].some(title => typeof title === "string" && this._normalizeTitle(title).toLowerCase() === normalized));
-                const cover = (exact || candidates[0])?.coverImage;
-                const imageUrl = cover?.large || cover?.medium;
+                const candidate = exact || candidates[0];
+                const cover = candidate && candidate.coverImage;
+                const imageUrl = cover && (cover.large || cover.medium);
                 if (typeof imageUrl === "string" && imageUrl) {
                     this._applyImage(job.index, imageUrl, job.retries);
                 } else if (error || !Array.isArray(media)) {
-                    const status = Number(error?.status || error?.extensions?.status);
+                    const status = Number(error && (error.status || error.extensions && error.extensions.status));
                     if (status === 429) this._retry(job.index, job.retries, "Rate limited", this._rateLimitDelay(response.headers));
                     else if ([400, 401, 403, 404].includes(status)) this._fail(job.index, status === 404 ? "No cover found" : `Cover unavailable (${status})`);
                     else this._retry(job.index, job.retries, "Bad response");
@@ -258,7 +298,7 @@ class ImageLoader {
                     this._fail(job.index, "No cover found");
                 }
             });
-        } catch {
+        } catch (error) {
             if (this._gen !== gen) return;
             const message = controller.signal.aborted ? "Request timed out" : response ? "Bad response" : "Network error";
             jobs.forEach(job => this._retry(job.index, job.retries, message));
@@ -299,7 +339,8 @@ class ImageLoader {
             this._enqueue(index);
             this._kick();
         };
-        spinner.replaceChildren(document.createTextNode(message), button);
+        spinner.textContent = message;
+        spinner.appendChild(button);
     }
 
     _setSpinner(index, text) {
@@ -348,6 +389,19 @@ class ImageLoader {
         img.src = url;
     }
 }
+
+// Ten searches share one request; stay below AniList's current 30 requests/minute.
+ImageLoader.MIN_INTERVAL = 2100;
+ImageLoader.BATCH_SIZE = 10;
+ImageLoader.RATE_LIMIT_PAUSE = 60000;
+ImageLoader.CACHE_KEY = 'vanilla-list:anilist-covers:v1';
+ImageLoader.CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+ImageLoader.CACHE_LIMIT = 500;
+ImageLoader.ERROR_PAUSE = 1000;
+ImageLoader.REQUEST_TIMEOUT = 10000;
+ImageLoader.IMAGE_TIMEOUT = 15000;
+ImageLoader.MAX_RETRIES = 2;
+
 
 const loader = new ImageLoader();
 let _scrollTimer;
@@ -410,7 +464,8 @@ function resetFilters() {
         b.classList.remove("active");
         b.setAttribute("aria-pressed", String(b.dataset.cat === "all"));
     });
-    document.querySelector('.cat-btn[data-cat="all"]')?.classList.add("active");
+    const allButton = document.querySelector('.cat-btn[data-cat="all"]');
+    if (allButton) allButton.classList.add("active");
     document.querySelector('input[name="tagLogic"][value="any"]').checked = true;
     updateDisplay();
 }
@@ -473,9 +528,9 @@ function initTagFilters() {
 // RANDOM
 // =============================================================================
 function clearHighlight() {
-    _highlightedCard?.classList.remove("highlighted");
+    if (_highlightedCard) _highlightedCard.classList.remove("highlighted");
     clearTimeout(_highlightTimer);
-    _highlightObserver?.disconnect();
+    if (_highlightObserver) _highlightObserver.disconnect();
     _highlightedCard = _highlightTimer = _highlightObserver = null;
 }
 
@@ -487,7 +542,12 @@ function randomAnime() {
     const card = document.getElementById(`card-${randomIndex}`);
     if (!card) return;
 
-    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if ("scrollBehavior" in document.documentElement.style) {
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else {
+        const rect = card.getBoundingClientRect();
+        window.scrollTo(0, Math.max(0, rect.top + window.scrollY + (rect.height - window.innerHeight) / 2));
+    }
     card.classList.add('highlighted');
     _highlightedCard = card;
 
@@ -499,7 +559,7 @@ function randomAnime() {
     if (typeof IntersectionObserver === "undefined") { expire(); return; }
     const observer = new IntersectionObserver(entries => {
         if (_highlightedCard !== card) { observer.disconnect(); return; }
-        if (entries.some(entry => entry.isIntersecting)) {
+        if (entries.some(isVisibleIntersection)) {
             observer.disconnect();
             _highlightObserver = null;
             expire();
@@ -514,7 +574,7 @@ function randomAnime() {
 // =============================================================================
 function updateScrollTopBtn() {
     if (!scrollTopBtn) return;
-    const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length;
+    const cols = parseInt(getComputedStyle(grid).getPropertyValue("--columns"), 10) || 1;
     const thresholdIndex = cols * 2;
     const sentinel = document.getElementById(`card-${thresholdIndex}`);
     if (!sentinel) {
@@ -597,18 +657,20 @@ async function copyTitle(title) {
     try {
         await navigator.clipboard.writeText(title);
         copied = true;
-    } catch {
+    } catch (error) {
         // The Clipboard API is absent on some browsers and insecure origins.
         const field = document.createElement("textarea");
         field.value = title;
         field.className = "clipboard-fallback";
         field.setAttribute("readonly", "");
         const focused = document.activeElement;
+        const x = window.scrollX, y = window.scrollY;
         document.body.appendChild(field);
         field.select();
-        try { copied = document.execCommand("copy"); } catch { /* Show the failure below. */ }
+        try { copied = document.execCommand("copy"); } catch (error) { /* Show the failure below. */ }
         field.remove();
-        focused?.focus({ preventScroll: true });
+        if (focused) focused.focus();
+        if (window.scrollX !== x || window.scrollY !== y) window.scrollTo(x, y);
     }
     const status = document.getElementById("copyStatus");
     clearTimeout(_copyTimer);
@@ -673,7 +735,7 @@ function renderCards(data) {
         const tags = card.querySelector(".tags");
         for (const tag of anime.tags) {
             const span = document.createElement("span");
-            span.className = `tag ${TAG_CLASS[tag] ?? "mixed"}`;
+            span.className = `tag ${TAG_CLASS[tag] || "mixed"}`;
             span.textContent = tag;
             tags.appendChild(span);
         }
