@@ -103,7 +103,7 @@ LD_LIBRARY_PATH=/tmp/vanilla-list-chrome56/libs/usr/lib/x86_64-linux-gnu \
 xvfb-run -a npm run test:chrome56
 ```
 
-The setup command downloads the official Chromium snapshot and four legacy
+The setup command downloads the official Chromium snapshot and eleven legacy
 library packages, verifies their SHA-256 checksums, and extracts them into a
 temporary directory. It does not install system packages. The browser test uses
 local synthetic API responses and cover pixels, with the fallback font, so no

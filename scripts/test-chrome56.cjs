@@ -120,6 +120,8 @@ async function main() {
         } else site.emit('request', req, res);
     });
     const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'vanilla-chrome56-profile-'));
+    const fontconfig = path.join(profile, 'fonts.conf');
+    await fs.writeFile(fontconfig, `<?xml version="1.0"?><fontconfig><dir>/usr/share/fonts/truetype/dejavu</dir><cachedir>${profile}/font-cache</cachedir></fontconfig>`);
     let browser, client, stderr = '';
     const exceptions = [];
     try {
@@ -130,7 +132,7 @@ async function main() {
             '--no-sandbox', '--disable-nacl', '--single-process', '--no-zygote', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking',
             '--disable-component-update', '--disable-extensions', '--disable-sync', '--no-first-run', '--no-default-browser-check',
             '--window-size=1600,1000', `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
-        ], { stdio: ['ignore', 'ignore', 'pipe'] });
+        ], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, FONTCONFIG_FILE: fontconfig } });
         browser.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-10000); });
         browser.on('error', error => { stderr += error.message; });
         let version;
