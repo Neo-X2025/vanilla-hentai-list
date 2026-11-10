@@ -127,7 +127,7 @@ async function main() {
         const origin = `http://127.0.0.1:${server.address().port}`;
         const port = await freePort();
         browser = spawn(process.env.CHROME56_PATH, [
-            '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking',
+            '--no-sandbox', '--disable-nacl', '--single-process', '--no-zygote', '--disable-gpu', '--disable-dev-shm-usage', '--disable-background-networking',
             '--disable-component-update', '--disable-extensions', '--disable-sync', '--no-first-run', '--no-default-browser-check',
             '--window-size=1600,1000', `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, 'about:blank',
         ], { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -209,6 +209,7 @@ async function main() {
         assert.deepEqual(exceptions, []);
         console.log('PASS: real XHR cancellation, timeouts, bounded retries and no JavaScript exceptions');
     } catch (error) {
+        if (browser) console.error(`Browser exit=${browser.exitCode}, signal=${browser.signalCode}`);
         console.error(stderr);
         if (exceptions.length) console.error('Page exceptions:', exceptions);
         throw error;
