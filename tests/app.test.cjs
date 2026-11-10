@@ -201,6 +201,13 @@ test('ten title lookups share one POST and keep full normalized titles in variab
     assert.equal(log[0].headers['Content-Type'], 'application/json');
 });
 
+test('legacy title normalization preserves Japanese letters and Unicode numbers', async t => {
+    const page = await loaderPage(t);
+    await render(page, ['東京々〆〇 café—❶']);
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => fetchLog[0].variables.q0), '東京々〆〇 café ❶');
+});
+
 test('batches stay bounded when more than ten cards are queued', async t => {
     const page = await loaderPage(t);
     await page.evaluate(() => { window.IntersectionObserver = undefined; });

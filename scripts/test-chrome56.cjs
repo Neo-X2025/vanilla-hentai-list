@@ -149,6 +149,7 @@ async function main() {
         await until(() => client.evaluate(`document.querySelectorAll('.card').length === ${total}`), 'Catalogue did not render');
         const capabilities = await client.evaluate(`({ grid: CSS.supports('display', 'grid'), aspectRatio: CSS.supports('aspect-ratio', '1'), abort: typeof AbortController, finallyMethod: typeof Promise.prototype.finally })`);
         if (expected === 56) assert.deepEqual(capabilities, { grid: false, aspectRatio: false, abort: 'undefined', finallyMethod: 'undefined' });
+        assert.equal(await client.evaluate('loader._normalizeTitle("東京々〆〇 café—❶")'), '東京々〆〇 café ❶');
         await client.evaluate('ImageLoader.MIN_INTERVAL = 10; ImageLoader.ERROR_PAUSE = 10; ImageLoader.REQUEST_TIMEOUT = 2000; window.scrollTo(0, document.getElementById("anime-grid").offsetTop);');
         await until(() => client.evaluate('Array.from(document.querySelectorAll(".card-img")).some(function(img) { return img.naturalWidth > 0 && img.style.display === "block"; })'), 'XHR cover loading failed');
         assert.ok(state.requests.length > 0);

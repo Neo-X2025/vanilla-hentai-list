@@ -222,7 +222,7 @@ class ImageLoader {
     _normalizeTitle(title) {
         // Separate punctuation without Unicode property escapes (Chrome 64+).
         // Keep accented, Japanese, and other non-ASCII title characters intact.
-        return title.normalize("NFKC").replace(/[\u0000-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u00BF\u2000-\u206F\u2600-\u27BF\u3000-\u303F\u30FB]+/g, " ").replace(/\s+/g, " ").trim();
+        return title.normalize("NFKC").replace(/[\u0000-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u00BF\u2000-\u206F\u2600-\u2775\u2794-\u27BF\u3000-\u3004\u3008-\u3020\u302A-\u3030\u3036-\u3037\u303D-\u303F\u30FB]+/g, " ").replace(/\s+/g, " ").trim();
     }
 
     _rateLimitDelay(headers) {
