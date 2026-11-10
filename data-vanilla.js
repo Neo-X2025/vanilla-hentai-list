@@ -25,7 +25,7 @@ const vanillaEntries = [
     ["Bakunyuu Oyako", "Good. Safe to watch.", ["MILF", "Vanilla"], 7],
     ["Bloods: Inraku no Ketsuzoku 2", "Not bad.", ["Incest", "Vanilla"], 6],
     ["Body Transfer", "Unique plot with some girl-on-girl content. Good scenes. Recommended.", ["Fantasy", "Vanilla", "Yuri"], 7],
-    ["Boku no Risou no Isekai Seikatsu", "Catgirls, a masterpiece with great graphics and surprisingly good plot. Isekai, very cute, and basically nonsense free. The whole world is cats!", ["Catgirls", "Fantasy", "Favorite", "Harem", "Loli", "Masterpiece", "Vanilla"], 10],
+    ["Boku no Risou no Isekai Seikatsu", "Catgirls, a masterpiece with great graphics and an interesting premise. Isekai, very cute, but some nonsense. Catgirls make me weak :)", ["Catgirls", "Fantasy", "Favorite", "Harem", "Loli", "Masterpiece", "Vanilla"], 10],
     ["Boku to Nurse no Kenshuu Nisshi The Animation", "Really nice.", ["Maid", "Nurse", "Vanilla"], 8],
     ["Bombastic Sisters", "Fast-paced, comedy-like scenes. Watchable.", ["Comedy", "Incest", "Vanilla"], 6],
     ["Bombastic Sisters 2", "Better than the prequel. Also watchable.", ["Comedy", "Incest", "Vanilla"], 6],

@@ -28,25 +28,25 @@
 
 <div class="controls-container">
     <div class="controls-row">
-        <input type="text" id="searchInput" class="search-box" placeholder="Search titles or notes...">
-        <select id="sortSelect" class="sort-dropdown">
+        <input type="search" id="searchInput" class="search-box" placeholder="Search titles, notes or tags..." aria-label="Search entries">
+        <select id="sortSelect" class="sort-dropdown" aria-label="Sort entries">
             <option value="score_desc">Score: High to Low</option>
             <option value="score_asc">Score: Low to High</option>
             <option value="title_asc">Title: A-Z</option>
             <option value="title_desc">Title: Z-A</option>
         </select>
         <button class="random-btn" onclick="randomAnime()" title="Jump to a random anime from current results">🎲 Random</button>
-        <span id="resultCount" class="result-count"></span>
+        <span id="resultCount" class="result-count" role="status"></span>
     </div>
 
     <div class="category-row">
-        <button class="cat-btn active" data-cat="all" onclick="setCategory('all')">🌐 All</button>
-        <button class="cat-btn" data-cat="vanilla" onclick="setCategory('vanilla')">💚 Vanilla</button>
-        <button class="cat-btn" data-cat="neutral" onclick="setCategory('neutral')">🟡 Neutral</button>
-        <button class="cat-btn" data-cat="avoid" onclick="setCategory('avoid')">🔴 Avoid</button>
+        <button class="cat-btn active" data-cat="all" aria-pressed="true" onclick="setCategory('all')">🌐 All</button>
+        <button class="cat-btn" data-cat="vanilla" aria-pressed="false" onclick="setCategory('vanilla')">💚 Vanilla</button>
+        <button class="cat-btn" data-cat="neutral" aria-pressed="false" onclick="setCategory('neutral')">🟡 Neutral</button>
+        <button class="cat-btn" data-cat="avoid" aria-pressed="false" onclick="setCategory('avoid')">🔴 Avoid</button>
     </div>
 
-    <div class="advanced-toggle" onclick="toggleAdvanced()">⚙️ Advanced Filters & Sorting ▼</div>
+    <button type="button" class="advanced-toggle" aria-expanded="false" aria-controls="advancedFilters" onclick="toggleAdvanced()">⚙️ Advanced Filters & Sorting ▼</button>
     <div id="advancedFilters" class="advanced-content">
         <div>
             <span class="filter-group-label">Score Range (Click to select multiple):</span>
@@ -69,7 +69,8 @@
 
 <div class="grid" id="anime-grid"></div>
 
-<button id="scrollTopBtn" class="scroll-top-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top">↑</button>
+<button id="scrollTopBtn" class="scroll-top-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top" aria-label="Back to top">↑</button>
+<div id="copyStatus" class="copy-status" role="status"></div>
 <div class="last-updated">Last updated: 13 May 2026</div>
 
 <script src="data-vanilla.js"></script>

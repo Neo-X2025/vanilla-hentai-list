@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem with the catalogue.
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the selected filters, affected entry, and site URL or commit.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and operating system
+      placeholder: Chrome on Android, Firefox on Linux, etc.
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Additional details
+      description: For cover failures, include any network status or console error. Remove private information.

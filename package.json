@@ -1,0 +1,23 @@
+{
+  "name": "vanilla-hentai-list",
+  "description": "A static, searchable review catalogue with batched cover lookups.",
+  "private": true,
+  "license": "0BSD",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Neo-X2025/vanilla-hentai-list.git"
+  },
+  "bugs": "https://github.com/Neo-X2025/vanilla-hentai-list/issues",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node scripts/serve.cjs",
+    "check": "node --check app.js && node scripts/validate-data.cjs",
+    "test": "node --test tests/*.test.cjs",
+    "test:live": "node scripts/smoke-api.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}
