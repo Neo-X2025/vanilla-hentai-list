@@ -11,8 +11,13 @@ const animeData = [
 // IMAGE LOADER
 // =============================================================================
 class ImageLoader {
-    // Stay below Jikan's per-minute limit as well as its per-second limit.
-    static MIN_INTERVAL = 1100;
+    // Ten searches share one request; stay below AniList's current 30 requests/minute.
+    static MIN_INTERVAL = 2100;
+    static BATCH_SIZE = 10;
+    static RATE_LIMIT_PAUSE = 60000;
+    static CACHE_KEY = 'vanilla-list:anilist-covers:v1';
+    static CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+    static CACHE_LIMIT = 500;
     static ERROR_PAUSE = 1000;
     static REQUEST_TIMEOUT = 10000;
     static IMAGE_TIMEOUT = 15000;
@@ -27,11 +32,13 @@ class ImageLoader {
         this._inFlight = false;
         this._lastFetch = 0;
         this._pauseUntil = 0;
+        this._serverInterval = 0;
         this._timer = null;
         this._frame = null;
         this._observer = null;
         this._controller = null;
         this._imageTimers = new Map();
+        this._restoreCache();
     }
 
     reset(data) {
@@ -75,11 +82,40 @@ class ImageLoader {
         });
     }
 
+    _restoreCache() {
+        try {
+            const records = JSON.parse(localStorage.getItem(ImageLoader.CACHE_KEY));
+            if (!Array.isArray(records)) return;
+            for (const record of records.slice(-ImageLoader.CACHE_LIMIT)) {
+                if (!Array.isArray(record) || record.length !== 2) continue;
+                const [title, value] = record;
+                if (typeof title === "string" && typeof value?.url === "string"
+                    && value.url.startsWith("https://") && Number.isFinite(value.expires)
+                    && value.expires > Date.now()) this._cache.set(title, value);
+            }
+        } catch { /* Storage may be blocked, full, or contain invalid JSON. */ }
+    }
+
+    _saveCache() {
+        try {
+            localStorage.setItem(ImageLoader.CACHE_KEY, JSON.stringify(
+                [...this._cache].filter(([, value]) => value.url.startsWith("https://"))
+            ));
+        } catch { /* In-memory caching still works when storage is unavailable. */ }
+    }
+
+    _cachedImage(title) {
+        const cached = this._cache.get(title);
+        if (cached?.expires > Date.now()) return cached.url;
+        this._cache.delete(title);
+        return null;
+    }
+
     _enqueue(index) {
         if (this._states[index] !== "idle") return;
-        const title = this._data[index]?.title;
-        if (this._cache.has(title)) {
-            this._applyImage(index, this._cache.get(title));
+        const cached = this._cachedImage(this._data[index]?.title);
+        if (cached) {
+            this._applyImage(index, cached);
             return;
         }
         this._states[index] = "queued";
@@ -102,24 +138,38 @@ class ImageLoader {
 
     _kick() {
         if (!this._queue.length || this._timer !== null || this._inFlight) return;
-        const wait = Math.max(0, this._pauseUntil - Date.now(), this._lastFetch + ImageLoader.MIN_INTERVAL - Date.now());
-        this._timer = setTimeout(() => this._process(), wait);
+        const interval = Math.max(ImageLoader.MIN_INTERVAL, this._serverInterval);
+        const wait = Math.max(0, this._pauseUntil - Date.now(), this._lastFetch + interval - Date.now());
+        // Long server cooldowns must not overflow the browser's timer range.
+        this._timer = setTimeout(() => this._process(), Math.min(wait, 60000));
     }
 
     _process() {
         this._timer = null;
-        while (this._queue.length && this._states[this._queue[0].index] !== "queued") this._queue.shift();
         if (!this._queue.length) return;
-        if (Date.now() < Math.max(this._pauseUntil, this._lastFetch + ImageLoader.MIN_INTERVAL)) {
+        const interval = Math.max(ImageLoader.MIN_INTERVAL, this._serverInterval);
+        if (Date.now() < Math.max(this._pauseUntil, this._lastFetch + interval)) {
             this._kick();
             return;
         }
-        const job = this._queue.shift();
+        const jobs = [];
+        while (this._queue.length && jobs.length < ImageLoader.BATCH_SIZE) {
+            const job = this._queue.shift();
+            if (this._states[job.index] !== "queued") continue;
+            const title = this._data[job.index]?.title;
+            const cached = this._cachedImage(title);
+            if (cached) { this._applyImage(job.index, cached, job.retries); continue; }
+            const query = this._normalizeTitle(title || "");
+            if (!query) { this._fail(job.index, "No cover found"); continue; }
+            this._states[job.index] = "loading";
+            this._setSpinner(job.index, "Loading…");
+            jobs.push({ ...job, title, query });
+        }
+        if (!jobs.length) { this._kick(); return; }
         const gen = this._gen;
-        this._states[job.index] = "loading";
         this._inFlight = true;
-        this._fetchOne(job).catch(() => {
-            if (this._gen === gen) this._retry(job.index, job.retries, "Cover unavailable");
+        this._fetchBatch(jobs).catch(() => {
+            if (this._gen === gen) jobs.forEach(job => this._retry(job.index, job.retries, "Cover unavailable"));
         }).finally(() => {
             if (this._gen !== gen) return;
             this._inFlight = false;
@@ -127,56 +177,91 @@ class ImageLoader {
         });
     }
 
-    async _fetchOne({ index, retries }) {
-        const title = this._data[index]?.title;
-        if (!title) { this._fail(index, "No cover found"); return; }
-        if (this._cache.has(title)) {
-            this._applyImage(index, this._cache.get(title), retries);
-            return;
-        }
-        // Replacing punctuation with spaces avoids joining words; keep distinctive long-title suffixes.
-        const query = title.normalize("NFKC").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-        if (!query) { this._fail(index, "No cover found"); return; }
-        const params = new URLSearchParams({ q: query, limit: "1", sfw: "false" });
+    _normalizeTitle(title) {
+        return title.normalize("NFKC").replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
+    }
+
+    _rateLimitDelay(headers) {
+        const raw = headers.get("Retry-After")?.trim();
+        const seconds = raw ? Number(raw) : NaN;
+        const retryAfter = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Date.parse(raw) - Date.now();
+        const reset = Number(headers.get("X-RateLimit-Reset")) * 1000 - Date.now();
+        const delays = [retryAfter, reset].filter(value => Number.isFinite(value) && value >= 0);
+        return delays.length ? Math.max(...delays) : ImageLoader.RATE_LIMIT_PAUSE;
+    }
+
+    async _fetchBatch(jobs) {
+        const definitions = jobs.map((_, i) => `$q${i}: String`).join(", ");
+        const fields = jobs.map((_, i) => `
+            c${i}: Page(page: 1, perPage: 3) {
+                media(search: $q${i}, type: ANIME) {
+                    title { romaji english native }
+                    synonyms
+                    coverImage { large medium }
+                }
+            }`).join("\n");
+        const variables = Object.fromEntries(jobs.map((job, i) => [`q${i}`, job.query]));
         const controller = new AbortController();
         const gen = this._gen;
         this._controller = controller;
         this._lastFetch = Date.now();
         const timeout = setTimeout(() => controller.abort(), ImageLoader.REQUEST_TIMEOUT);
-        this._setSpinner(index, "Loading…");
         let response;
         try {
-            response = await fetch(`https://api.jikan.moe/v4/anime?${params}`, { signal: controller.signal });
+            response = await fetch("https://graphql.anilist.co", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Accept: "application/json" },
+                credentials: "omit",
+                body: JSON.stringify({ query: `query (${definitions}) { ${fields} }`, variables }),
+                signal: controller.signal,
+            });
             if (this._gen !== gen) return;
+            const limit = Number(response.headers.get("X-RateLimit-Limit"));
+            if (Number.isFinite(limit) && limit >= 1) this._serverInterval = Math.ceil(60000 / limit) + 100;
+            if (response.headers.get("X-RateLimit-Remaining") === "0") {
+                this._pauseUntil = Math.max(this._pauseUntil, Date.now() + this._rateLimitDelay(response.headers));
+            }
             if (response.status === 429) {
-                const raw = response.headers.get("Retry-After")?.trim();
-                const seconds = raw ? Number(raw) : NaN;
-                const delay = Number.isFinite(seconds) && seconds >= 0
-                    ? seconds * 1000 : Date.parse(raw) - Date.now();
-                this._retry(index, retries, "Rate limited", Math.max(
-                    ImageLoader.ERROR_PAUSE * 2 ** retries,
-                    Number.isFinite(delay) ? delay : 0
-                ));
+                const delay = this._rateLimitDelay(response.headers);
+                jobs.forEach(job => this._retry(job.index, job.retries, "Rate limited", delay));
                 return;
             }
             if (!response.ok) {
-                if (response.status >= 500 || response.status === 408) this._retry(index, retries, `Error ${response.status}`);
-                else this._fail(index, `Cover unavailable (${response.status})`);
+                for (const job of jobs) {
+                    if (response.status >= 500 || response.status === 408) this._retry(job.index, job.retries, `Error ${response.status}`);
+                    else this._fail(job.index, `Cover unavailable (${response.status})`);
+                }
                 return;
             }
             const json = await response.json();
             if (this._gen !== gen) return;
-            const images = json?.data?.[0]?.images;
-            const imageUrl = images?.jpg?.image_url || images?.jpg?.large_image_url
-                || images?.webp?.image_url || images?.webp?.large_image_url;
-            if (typeof imageUrl !== "string" || !imageUrl) {
-                this._fail(index, "No cover found");
-                return;
-            }
-            this._applyImage(index, imageUrl, retries);
+            const errors = Array.isArray(json?.errors) ? json.errors : [];
+            jobs.forEach((job, i) => {
+                const alias = `c${i}`;
+                const error = errors.find(err => err?.path?.[0] === alias) || errors.find(err => !err?.path?.length);
+                const media = json?.data?.[alias]?.media;
+                const candidates = Array.isArray(media) ? media : [];
+                const normalized = this._normalizeTitle(job.title).toLowerCase();
+                const exact = candidates.find(entry => [
+                    ...Object.values(entry?.title || {}), ...(Array.isArray(entry?.synonyms) ? entry.synonyms : [])
+                ].some(title => typeof title === "string" && this._normalizeTitle(title).toLowerCase() === normalized));
+                const cover = (exact || candidates[0])?.coverImage;
+                const imageUrl = cover?.large || cover?.medium;
+                if (typeof imageUrl === "string" && imageUrl) {
+                    this._applyImage(job.index, imageUrl, job.retries);
+                } else if (error || !Array.isArray(media)) {
+                    const status = Number(error?.status || error?.extensions?.status);
+                    if (status === 429) this._retry(job.index, job.retries, "Rate limited", this._rateLimitDelay(response.headers));
+                    else if ([400, 401, 403, 404].includes(status)) this._fail(job.index, status === 404 ? "No cover found" : `Cover unavailable (${status})`);
+                    else this._retry(job.index, job.retries, "Bad response");
+                } else {
+                    this._fail(job.index, "No cover found");
+                }
+            });
         } catch {
             if (this._gen !== gen) return;
-            this._retry(index, retries, controller.signal.aborted ? "Request timed out" : response ? "Bad response" : "Network error");
+            const message = controller.signal.aborted ? "Request timed out" : response ? "Bad response" : "Network error";
+            jobs.forEach(job => this._retry(job.index, job.retries, message));
         } finally {
             clearTimeout(timeout);
             if (this._controller === controller) this._controller = null;
@@ -238,6 +323,7 @@ class ImageLoader {
             if (this._gen !== gen) return;
             cleanup();
             this._cache.delete(title);
+            this._saveCache();
             img.removeAttribute("src");
             img.style.display = "none";
             this._retry(index, retries, "Cover failed to load");
@@ -249,7 +335,10 @@ class ImageLoader {
             spinner.style.display = "none";
             this._states[index] = "done";
             // Cache only images the browser actually loaded successfully.
-            this._cache.set(title, url);
+            this._cache.delete(title);
+            this._cache.set(title, { url, expires: Date.now() + ImageLoader.CACHE_TTL });
+            while (this._cache.size > ImageLoader.CACHE_LIMIT) this._cache.delete(this._cache.keys().next().value);
+            this._saveCache();
             const container = img.closest(".card-img-container");
             if (container) container.style.backgroundColor = "transparent";
         };

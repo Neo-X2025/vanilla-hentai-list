@@ -1,6 +1,6 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const http = require('node:http');
+const { createServer } = require('../scripts/serve.cjs');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { chromium } = require('playwright');
@@ -15,15 +15,7 @@ const fixtures = {
 let server, browser, baseURL;
 
 before(async () => {
-    server = http.createServer(async (req, res) => {
-        const name = new URL(req.url, 'http://localhost').pathname;
-        const files = { '/': 'index.html', '/app.js': 'app.js', '/styles.css': 'styles.css', '/favicon.png': 'favicon.png' };
-        const file = files[name];
-        if (!file) { res.writeHead(404).end(); return; }
-        const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png' };
-        res.setHeader('Content-Type', types[path.extname(file)]);
-        res.end(await fs.readFile(path.join(root, file)));
-    });
+    server = createServer();
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     baseURL = `http://127.0.0.1:${server.address().port}`;
     browser = await chromium.launch({
@@ -58,10 +50,19 @@ async function openPage(t, entries = fixtures, init) {
         window.testPixel = pixel;
         window.nativeFetch = window.fetch.bind(window);
         window.fetchLog = [];
-        window.fetch = async (url, options) => {
-            window.fetchLog.push({ url, time: Date.now() });
-            return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: pixel } } }] }));
+        window.respond = (variables, result) => new Response(JSON.stringify({
+            data: Object.fromEntries(Object.entries(variables).map(([name, title]) => [name.replace('q', 'c'), {
+                media: result ? result(title) : [{ title: { romaji: title }, coverImage: { large: pixel } }],
+            }])),
+        }));
+        window.setApiHandler = handler => {
+            window.fetch = async (url, options) => {
+                const body = JSON.parse(options.body);
+                window.fetchLog.push({ url, ...body, headers: options.headers, time: Date.now() });
+                return handler(body.variables, options);
+            };
         };
+        window.setApiHandler(variables => window.respond(variables));
     }, { pixel });
     if (init) await context.addInitScript(init);
     const page = await context.newPage();
@@ -72,13 +73,14 @@ async function openPage(t, entries = fixtures, init) {
     return page;
 }
 
-async function loaderPage(t) {
-    const page = await openPage(t);
+async function loaderPage(t, entries = fixtures) {
+    const page = await openPage(t, entries);
     await page.evaluate(() => {
         loader.reset([]);
         loader._cache.clear();
         ImageLoader.MIN_INTERVAL = 10;
         ImageLoader.ERROR_PAUSE = 10;
+        ImageLoader.RATE_LIMIT_PAUSE = 10;
         ImageLoader.REQUEST_TIMEOUT = 100;
         ImageLoader.IMAGE_TIMEOUT = 100;
         window.fetchLog = [];
@@ -183,77 +185,134 @@ test('missing Clipboard API uses a fallback and failed copying gives feedback', 
     assert.deepEqual(page.errors, []);
 });
 
-test('covers load successfully and queries keep the full normalized title', async t => {
+test('ten title lookups share one POST and keep full normalized titles in variables', async t => {
     const page = await loaderPage(t);
-    const title = 'A Long: Distinctive Title With More Than Forty Characters & Its Sequel';
-    await render(page, [title]);
-    await loaded(page, 0);
-    const urls = await page.evaluate(() => fetchLog.map(entry => entry.url));
-    const url = new URL(urls[0]);
-    assert.equal(url.origin, 'https://api.jikan.moe');
-    assert.equal(url.pathname, '/v4/anime');
-    assert.equal(url.searchParams.get('q'), 'A Long Distinctive Title With More Than Forty Characters Its Sequel');
-    assert.equal(url.searchParams.get('limit'), '1');
+    await page.evaluate(() => { window.IntersectionObserver = undefined; });
+    const titles = ['A Long: Distinctive Title With More Than Forty Characters & Its Sequel', ...Array.from({ length: 9 }, (_, i) => `Entry ${i}`)];
+    await render(page, titles);
+    await loaded(page, 9);
+    const log = await page.evaluate(() => fetchLog);
+    assert.equal(log.length, 1);
+    assert.equal(log[0].url, 'https://graphql.anilist.co');
+    assert.equal(Object.keys(log[0].variables).length, 10);
+    assert.equal(log[0].variables.q0, 'A Long Distinctive Title With More Than Forty Characters Its Sequel');
+    assert.match(log[0].query, /c9: Page/);
+    assert.ok(!log[0].query.includes('Distinctive'));
+    assert.equal(log[0].headers['Content-Type'], 'application/json');
 });
 
-test('empty results do not block later covers and can be retried manually', async t => {
+test('batches stay bounded when more than ten cards are queued', async t => {
     const page = await loaderPage(t);
-    await page.evaluate(() => {
-        window.fetch = async url => {
-            fetchLog.push(url);
-            const empty = new URL(url).searchParams.get('q') === 'First' && !window.recover;
-            return new Response(JSON.stringify({ data: empty ? [] : [{ images: { jpg: { image_url: testPixel } } }] }));
-        };
-    });
+    await page.evaluate(() => { window.IntersectionObserver = undefined; });
+    await render(page, Array.from({ length: 23 }, (_, i) => `Entry ${i}`));
+    await loaded(page, 22);
+    const log = await page.evaluate(() => fetchLog);
+    assert.equal(log.length, 3);
+    assert.deepEqual(log.map(request => Object.keys(request.variables).length), [10, 10, 3]);
+});
+
+test('an empty search does not block its batch and can be retried manually', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => setApiHandler(variables => respond(variables, title =>
+        title === 'First' && !window.recover ? [] : [{ coverImage: { large: testPixel } }]
+    )));
     await render(page);
     await loaded(page, 1);
     assert.match(await page.locator('#spinner-0').textContent(), /no cover/i);
-    assert.equal(await page.evaluate(() => fetchLog.filter(url => new URL(url).searchParams.get('q') === 'First').length), 1);
+    assert.equal(await page.evaluate(() => fetchLog.length), 1);
     await page.evaluate(() => { window.recover = true; });
     await page.locator('#card-0 .image-retry').click();
     await loaded(page, 0);
     assert.equal(await page.locator('#copyStatus').textContent(), '');
+    assert.equal(await page.evaluate(() => fetchLog.length), 2);
 });
 
 for (const failure of ['network', 'server', 'rate-limit', 'invalid-json', 'missing-data', 'broken-image', '404']) {
-    test(`${failure} failures terminate and let other covers load`, async t => {
+    test(`${failure} failures terminate and let later batches load`, async t => {
         const page = await loaderPage(t);
         await page.evaluate(failure => {
-            window.fetch = async url => {
-                fetchLog.push(url);
-                if (new URL(url).searchParams.get('q') !== 'First') {
-                    return new Response(JSON.stringify({ data: [{ images: { webp: { image_url: testPixel } } }] }));
-                }
+            ImageLoader.BATCH_SIZE = 1;
+            setApiHandler(variables => {
+                if (!Object.values(variables).includes('First')) return respond(variables);
                 if (failure === 'network') throw new TypeError('Failed to fetch');
                 if (failure === 'server') return new Response('', { status: 503 });
                 if (failure === '404') return new Response('', { status: 404 });
                 if (failure === 'rate-limit') return new Response('', { status: 429, headers: { 'Retry-After': 'invalid' } });
                 if (failure === 'invalid-json') return new Response('{broken');
                 if (failure === 'missing-data') return new Response('null');
-                return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: 'data:image/png;base64,broken' } } }] }));
-            };
+                return respond(variables, () => [{ coverImage: { large: 'data:image/png;base64,broken' } }]);
+            });
         }, failure);
         await render(page);
         await loaded(page, 1);
         await page.waitForFunction(() => loader._states[0] === 'error', null, { timeout: 3000 });
-        const attempts = await page.evaluate(() => fetchLog.filter(url => new URL(url).searchParams.get('q') === 'First').length);
-        assert.equal(attempts, ['404', 'missing-data'].includes(failure) ? 1 : 3);
+        const attempts = await page.evaluate(() => fetchLog.filter(request => Object.values(request.variables).includes('First')).length);
+        assert.equal(attempts, failure === '404' ? 1 : 3);
         assert.equal(await page.locator('#card-0 .image-retry').count(), 1);
         assert.deepEqual(page.errors, []);
     });
 }
 
-test('a hung request times out and releases the queue', async t => {
+test('partial GraphQL errors retry only failed aliases and preserve successful covers', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => setApiHandler(variables => {
+        const data = {};
+        const errors = [];
+        for (const [key, title] of Object.entries(variables)) {
+            const alias = key.replace('q', 'c');
+            data[alias] = title === 'First' ? null : { media: [{ coverImage: { large: testPixel } }] };
+            if (title === 'First') errors.push({ path: [alias], status: 500, message: 'Temporary failure' });
+        }
+        return new Response(JSON.stringify({ data, errors }));
+    }));
+    await render(page);
+    await loaded(page, 1);
+    await page.waitForFunction(() => loader._states[0] === 'error');
+    const log = await page.evaluate(() => fetchLog);
+    assert.equal(log.length, 3);
+    assert.equal(log.filter(request => Object.values(request.variables).includes('Second')).length, 1);
+});
+
+test('HTTP 200 GraphQL rate-limit errors respect the provider reset time', async t => {
     const page = await loaderPage(t);
     await page.evaluate(() => {
+        window.retryUntil = Math.ceil((Date.now() + 300) / 1000) * 1000;
+        setApiHandler(variables => fetchLog.length === 1
+            ? new Response(JSON.stringify({ data: null, errors: [{ status: 429, message: 'Too Many Requests' }] }), {
+                headers: { 'X-RateLimit-Reset': String(retryUntil / 1000) },
+            }) : respond(variables));
+    });
+    await render(page);
+    await loaded(page, 0);
+    const { log, until } = await page.evaluate(() => ({ log: fetchLog, until: retryUntil }));
+    assert.equal(log.length, 2);
+    assert.ok(log[1].time >= until - 5);
+});
+
+test('exact alternate titles beat the first fuzzy search hit', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => setApiHandler(variables => respond(variables, title => [
+        { title: { romaji: 'Wrong sequel' }, coverImage: { large: 'data:image/png;base64,broken' } },
+        { title: { romaji: 'Alternate' }, synonyms: [title], coverImage: { medium: testPixel } },
+    ])));
+    await render(page, ['Exact']);
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => fetchLog.length), 1);
+    assert.equal(await page.locator('#img-0').getAttribute('src'), pixel);
+});
+
+test('a hung batch times out and releases later batches', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        ImageLoader.BATCH_SIZE = 1;
         window.abortCount = 0;
-        window.fetch = (url, options) => {
-            if (new URL(url).searchParams.get('q') !== 'First') return Promise.resolve(new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: testPixel } } }] })));
-            return new Promise((resolve, reject) => options?.signal.addEventListener('abort', () => {
+        setApiHandler((variables, options) => {
+            if (!Object.values(variables).includes('First')) return respond(variables);
+            return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => {
                 abortCount++;
                 reject(new DOMException('Aborted', 'AbortError'));
             }));
-        };
+        });
     });
     await render(page);
     await loaded(page, 1);
@@ -261,23 +320,23 @@ test('a hung request times out and releases the queue', async t => {
     assert.equal(await page.evaluate(() => abortCount), 3);
 });
 
-test('filter changes abort old requests and stale JSON errors cannot alter new cards', async t => {
+test('filter changes abort old batches and stale JSON errors cannot alter new cards', async t => {
     const page = await loaderPage(t);
     await page.evaluate(() => {
         ImageLoader.REQUEST_TIMEOUT = 3000;
-        window.fetch = async (url, options) => {
-            if (new URL(url).searchParams.get('q') === 'Old') {
-                window.oldSignal = options?.signal;
+        setApiHandler((variables, options) => {
+            if (Object.values(variables).includes('Old')) {
+                window.oldSignal = options.signal;
                 return { ok: true, status: 200, headers: new Headers(), json: () => new Promise((resolve, reject) => { window.rejectOld = reject; }) };
             }
-            return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: testPixel } } }] }));
-        };
+            return respond(variables);
+        });
     });
     await render(page, ['Old']);
     await page.waitForFunction(() => typeof window.rejectOld === 'function');
     await render(page, ['New']);
     await loaded(page, 0);
-    assert.equal(await page.evaluate(() => window.oldSignal?.aborted), true);
+    assert.equal(await page.evaluate(() => window.oldSignal.aborted), true);
     await page.evaluate(() => { window.rejectOld(new SyntaxError('Old response')); });
     await page.waitForTimeout(50);
     assert.equal(await page.evaluate(() => loader._states[0]), 'done');
@@ -285,31 +344,77 @@ test('filter changes abort old requests and stale JSON errors cannot alter new c
     assert.deepEqual(page.errors, []);
 });
 
-for (const format of ['seconds', 'date']) {
-    test(`Retry-After ${format} delays all subsequent API requests`, async t => {
+for (const format of ['seconds', 'date', 'missing']) {
+    test(`Retry-After ${format} delays subsequent batches`, async t => {
         const page = await loaderPage(t);
         await page.evaluate(format => {
             window.retryUntil = 0;
-            window.fetch = async url => {
-                fetchLog.push({ url, time: Date.now() });
-                if (fetchLog.length === 1) {
-                    const retryAfter = format === 'seconds' ? '0.15' : new Date(Date.now() + 1500).toUTCString();
-                    window.retryUntil = format === 'seconds' ? Date.now() + 150 : Date.parse(retryAfter);
-                    return new Response('', { status: 429, headers: { 'Retry-After': retryAfter } });
-                }
-                return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: testPixel } } }] }));
-            };
+            setApiHandler(variables => {
+                if (fetchLog.length !== 1) return respond(variables);
+                const headers = {};
+                if (format !== 'missing') headers['Retry-After'] = format === 'seconds' ? '0.15' : new Date(Date.now() + 1500).toUTCString();
+                retryUntil = format === 'seconds' ? Date.now() + 150 : format === 'date' ? Date.parse(headers['Retry-After']) : Date.now() + ImageLoader.RATE_LIMIT_PAUSE;
+                return new Response('', { status: 429, headers });
+            });
         }, format);
         await render(page);
         await loaded(page, 0);
         await loaded(page, 1);
         const { log, until } = await page.evaluate(() => ({ log: fetchLog, until: retryUntil }));
-        assert.equal(log.length, 3);
-        assert.ok(log.slice(1).every(entry => entry.time >= until - 5));
+        assert.equal(log.length, 2);
+        assert.ok(log[1].time >= until - 5);
     });
 }
 
-test('rapid renders do not schedule duplicate cover requests', async t => {
+test('successful responses with exhausted quota delay the next batch', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        window.retryUntil = Math.ceil((Date.now() + 300) / 1000) * 1000;
+        setApiHandler(async variables => {
+            const response = respond(variables);
+            if (fetchLog.length === 1) {
+                response.headers.set('X-RateLimit-Remaining', '0');
+                response.headers.set('X-RateLimit-Reset', String(retryUntil / 1000));
+            }
+            return response;
+        });
+    });
+    await render(page, ['Before']);
+    await loaded(page, 0);
+    await render(page, ['After']);
+    await loaded(page, 0);
+    const { log, until } = await page.evaluate(() => ({ log: fetchLog, until: retryUntil }));
+    assert.equal(log.length, 2);
+    assert.ok(log[1].time >= until - 5);
+});
+
+test('batches are serialized and provider limits survive filter changes', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        ImageLoader.REQUEST_TIMEOUT = 2000;
+        window.concurrent = 0;
+        window.maxConcurrent = 0;
+        setApiHandler(async variables => {
+            window.maxConcurrent = Math.max(window.maxConcurrent, ++window.concurrent);
+            await new Promise(resolve => setTimeout(resolve, 30));
+            window.concurrent--;
+            const response = respond(variables);
+            response.headers.set('X-RateLimit-Limit', '600');
+            return response;
+        });
+    });
+    await render(page, ['Before']);
+    await loaded(page, 0);
+    await render(page, ['After', 'Another']);
+    await loaded(page, 0);
+    await loaded(page, 1);
+    const { log, concurrent } = await page.evaluate(() => ({ log: fetchLog, concurrent: maxConcurrent }));
+    assert.equal(log.length, 2);
+    assert.equal(concurrent, 1);
+    assert.ok(log[1].time - log[0].time >= 195);
+});
+
+test('rapid renders do not schedule duplicate batch requests', async t => {
     const page = await loaderPage(t);
     await page.evaluate(() => {
         const data = [{ title: 'Only', note: '', tags: [], score: 5 }];
@@ -325,12 +430,122 @@ test('covers outside the viewport wait until scrolled near', async t => {
     const page = await loaderPage(t);
     await render(page, Array.from({ length: 60 }, (_, i) => `Entry ${i}`));
     await loaded(page, 0);
-    const initially = await page.evaluate(() => fetchLog.map(entry => new URL(entry.url).searchParams.get('q')));
+    const initially = await page.evaluate(() => fetchLog.flatMap(entry => Object.values(entry.variables)));
     assert.ok(!initially.includes('Entry 59'));
     await page.locator('#card-59').scrollIntoViewIfNeeded();
     await loaded(page, 59);
 });
 
+test('real browser Fetch handles GraphQL POST and CORS', async t => {
+    const page = await loaderPage(t);
+    const requests = [];
+    await page.route('https://graphql.anilist.co/', async route => {
+        const headers = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        };
+        if (route.request().method() === 'OPTIONS') {
+            await route.fulfill({ status: 204, headers });
+            return;
+        }
+        const request = route.request().postDataJSON();
+        requests.push(request);
+        const data = Object.fromEntries(Object.keys(request.variables).map(key => [key.replace('q', 'c'), { media: [{ coverImage: { large: pixel } }] }]));
+        await route.fulfill({ contentType: 'application/json', headers, body: JSON.stringify({ data }) });
+    });
+    await page.evaluate(() => { window.fetch = window.nativeFetch; ImageLoader.REQUEST_TIMEOUT = 2000; });
+    await render(page, ['Contract Test', 'Another']);
+    await loaded(page, 0);
+    await loaded(page, 1);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(Object.values(requests[0].variables), ['Contract Test', 'Another']);
+    assert.deepEqual(page.errors, []);
+});
+
+test('a stalled image download times out without blocking its batch', async t => {
+    const page = await loaderPage(t);
+    await page.route('https://covers.test/slow.png', () => {});
+    await page.evaluate(() => setApiHandler(variables => respond(variables, title => [{
+        coverImage: { large: title === 'First' ? 'https://covers.test/slow.png' : testPixel },
+    }])));
+    await render(page);
+    await loaded(page, 1);
+    await page.waitForFunction(() => loader._states[0] === 'error', null, { timeout: 3000 });
+    assert.equal(await page.evaluate(() => fetchLog.filter(request => Object.values(request.variables).includes('First')).length), 3);
+    assert.equal(await page.locator('#card-0 .image-retry').count(), 1);
+});
+
+test('verified covers are reused without another API request', async t => {
+    const page = await loaderPage(t);
+    await render(page, ['Cached']);
+    await loaded(page, 0);
+    await render(page, ['Cached']);
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => fetchLog.length), 1);
+});
+
+test('verified HTTPS covers survive a page reload', async t => {
+    const entries = { vanilla: [['Cached', '', [], 5]], neutral: [], avoid: [] };
+    const page = await loaderPage(t, entries);
+    await page.route('https://covers.test/cache.png', route => route.fulfill({ contentType: 'image/png', body: Buffer.from(pixel.split(',')[1], 'base64') }));
+    await page.evaluate(() => setApiHandler(variables => respond(variables, () => [{ coverImage: { large: 'https://covers.test/cache.png' } }])));
+    await render(page, ['Cached']);
+    await loaded(page, 0);
+    await page.reload();
+    await page.locator('#anime-grid').scrollIntoViewIfNeeded();
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => fetchLog.length), 0);
+    assert.equal(await page.locator('#img-0').getAttribute('src'), 'https://covers.test/cache.png');
+});
+
+for (const failure of ['blocked', 'invalid-json', 'expired']) {
+    test(`${failure} persistent cache falls back to the API`, async t => {
+        const page = await openPage(t, { vanilla: [['Cached', '', [], 5]], neutral: [], avoid: [] });
+        const key = await page.evaluate(() => ImageLoader.CACHE_KEY);
+        await page.addInitScript(({ failure, key }) => {
+            if (failure === 'blocked') Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('Blocked', 'SecurityError'); } });
+            else localStorage.setItem(key, failure === 'invalid-json' ? '{broken' : JSON.stringify([
+                ['Cached', { url: 'https://covers.test/expired.png', expires: Date.now() - 1 }],
+            ]));
+        }, { failure, key });
+        await page.reload();
+        await page.locator('#anime-grid').scrollIntoViewIfNeeded();
+        await loaded(page, 0);
+        assert.equal(await page.evaluate(() => fetchLog.length), 1);
+        assert.deepEqual(page.errors, []);
+    });
+}
+
+test('detached image callbacks cannot modify replacement cards', async t => {
+    const page = await loaderPage(t);
+    await page.route('https://covers.test/old.png', () => {});
+    await page.evaluate(() => {
+        ImageLoader.IMAGE_TIMEOUT = 3000;
+        setApiHandler(variables => respond(variables, title => [{
+            coverImage: { large: title === 'Old' ? 'https://covers.test/old.png' : testPixel },
+        }]));
+    });
+    await render(page, ['Old']);
+    await page.waitForFunction(() => document.getElementById('img-0').getAttribute('src') === 'https://covers.test/old.png');
+    await page.evaluate(() => {
+        const img = document.getElementById('img-0');
+        window.oldImageCallbacks = [img.onload, img.onerror];
+    });
+    await render(page, ['New']);
+    await loaded(page, 0);
+    await page.evaluate(() => window.oldImageCallbacks.forEach(callback => callback()));
+    assert.equal(await page.evaluate(() => loader._states[0]), 'done');
+    assert.equal(await page.locator('#spinner-0').isVisible(), false);
+});
+
+test('browsers without IntersectionObserver still load covers and clear highlights', async t => {
+    const page = await openPage(t, fixtures, () => { window.IntersectionObserver = undefined; });
+    await loaded(page, 0);
+    await page.evaluate(() => { Math.random = () => 0; randomAnime(); });
+    await page.waitForFunction(() => !document.getElementById('card-0').classList.contains('highlighted'), null, { timeout: 3000 });
+    assert.deepEqual(page.errors, []);
+});
 test('random highlight expires on tall cards and is cleared by filtering', async t => {
     const page = await openPage(t);
     await page.evaluate(() => {
@@ -365,123 +580,5 @@ test('the actual catalogue renders with valid scores, tags and no script errors'
     assert.ok(counts.data > 0);
     assert.equal(counts.rendered, counts.data);
     assert.equal(counts.invalid, 0);
-    assert.deepEqual(page.errors, []);
-});
-
-test('real browser Fetch handles the Jikan response contract and CORS', async t => {
-    const page = await loaderPage(t);
-    const requests = [];
-    await page.route('https://api.jikan.moe/v4/anime?**', async route => {
-        requests.push(route.request().url());
-        await route.fulfill({
-            contentType: 'application/json',
-            headers: { 'Access-Control-Allow-Origin': '*' },
-            body: JSON.stringify({ pagination: {}, data: [{ images: { jpg: { image_url: pixel } } }] }),
-        });
-    });
-    await page.evaluate(() => { window.fetch = window.nativeFetch; ImageLoader.REQUEST_TIMEOUT = 2000; });
-    await render(page, ['Contract Test']);
-    await loaded(page, 0);
-    assert.equal(requests.length, 1);
-    assert.equal(new URL(requests[0]).searchParams.get('q'), 'Contract Test');
-    assert.deepEqual(page.errors, []);
-});
-
-test('a stalled image download times out without blocking other covers', async t => {
-    const page = await loaderPage(t);
-    await page.route('https://covers.test/slow.png', () => {});
-    await page.evaluate(() => {
-        window.fetch = async url => {
-            fetchLog.push(url);
-            const image = new URL(url).searchParams.get('q') === 'First' ? 'https://covers.test/slow.png' : testPixel;
-            return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: image } } }] }));
-        };
-    });
-    await render(page);
-    await loaded(page, 1);
-    await page.waitForFunction(() => loader._states[0] === 'error', null, { timeout: 3000 });
-    assert.equal(await page.evaluate(() => fetchLog.filter(url => new URL(url).searchParams.get('q') === 'First').length), 3);
-    assert.equal(await page.locator('#card-0 .image-retry').count(), 1);
-});
-
-test('verified covers are reused from cache without another API request', async t => {
-    const page = await loaderPage(t);
-    await render(page, ['Cached']);
-    await loaded(page, 0);
-    await render(page, ['Cached']);
-    await loaded(page, 0);
-    assert.equal(await page.evaluate(() => fetchLog.length), 1);
-});
-
-test('detached image callbacks cannot modify replacement cards', async t => {
-    const page = await loaderPage(t);
-    await page.route('https://covers.test/old.png', () => {});
-    await page.evaluate(() => {
-        ImageLoader.IMAGE_TIMEOUT = 3000;
-        window.fetch = async url => {
-            const image = new URL(url).searchParams.get('q') === 'Old' ? 'https://covers.test/old.png' : testPixel;
-            return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: image } } }] }));
-        };
-    });
-    await render(page, ['Old']);
-    await page.waitForFunction(() => document.getElementById('img-0').getAttribute('src') === 'https://covers.test/old.png');
-    await page.evaluate(() => {
-        const img = document.getElementById('img-0');
-        window.oldImageCallbacks = [img.onload, img.onerror];
-    });
-    await render(page, ['New']);
-    await loaded(page, 0);
-    await page.evaluate(() => window.oldImageCallbacks.forEach(callback => callback()));
-    assert.equal(await page.evaluate(() => loader._states[0]), 'done');
-    assert.equal(await page.locator('#spinner-0').isVisible(), false);
-});
-
-test('requests are serialized and minimum spacing survives filter changes', async t => {
-    const page = await loaderPage(t);
-    await page.evaluate(() => {
-        ImageLoader.MIN_INTERVAL = 80;
-        ImageLoader.REQUEST_TIMEOUT = 2000;
-        window.concurrent = 0;
-        window.maxConcurrent = 0;
-        window.fetch = async url => {
-            window.maxConcurrent = Math.max(window.maxConcurrent, ++window.concurrent);
-            fetchLog.push({ url, time: Date.now() });
-            await new Promise(resolve => setTimeout(resolve, 30));
-            window.concurrent--;
-            return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: testPixel } } }] }));
-        };
-    });
-    await render(page, ['Before']);
-    await loaded(page, 0);
-    await render(page, ['After', 'Another']);
-    await loaded(page, 0);
-    await loaded(page, 1);
-    const { log, concurrent } = await page.evaluate(() => ({ log: fetchLog, concurrent: maxConcurrent }));
-    assert.equal(log.length, 3);
-    assert.equal(concurrent, 1);
-    for (let i = 1; i < log.length; i++) assert.ok(log[i].time - log[i - 1].time >= 75);
-});
-
-test('missing Retry-After uses a bounded fallback delay', async t => {
-    const page = await loaderPage(t);
-    await page.evaluate(() => {
-        window.fetch = async url => {
-            fetchLog.push({ url, time: Date.now() });
-            if (fetchLog.length === 1) return new Response('', { status: 429 });
-            return new Response(JSON.stringify({ data: [{ images: { jpg: { image_url: testPixel } } }] }));
-        };
-    });
-    await render(page, ['Retry']);
-    await loaded(page, 0);
-    const log = await page.evaluate(() => fetchLog);
-    assert.equal(log.length, 2);
-    assert.ok(log[1].time - log[0].time >= 10);
-});
-
-test('browsers without IntersectionObserver still load covers and clear highlights', async t => {
-    const page = await openPage(t, fixtures, () => { window.IntersectionObserver = undefined; });
-    await loaded(page, 0);
-    await page.evaluate(() => { Math.random = () => 0; randomAnime(); });
-    await page.waitForFunction(() => !document.getElementById('card-0').classList.contains('highlighted'), null, { timeout: 3000 });
     assert.deepEqual(page.errors, []);
 });

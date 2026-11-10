@@ -1,48 +1,87 @@
 # Vanilla Hentai List
 
-A static catalogue with search, score and tag filters, sorting, and cover images.
-Serve this directory with any static web server, for example:
+A static review catalogue with search, category and score filters, OR/AND tag
+matching, sorting, random selection, and cover images. Built with plain HTML,
+CSS, and JavaScript. No framework, build step, server account, or API key is needed.
+
+## Run locally
+
+Open `index.html` directly, or serve the repository with a static web server.
+The included preview server requires Node.js 22 or newer:
 
 ```sh
-python3 -m http.server 8000
+npm start
 ```
 
-Open `http://localhost:8000`. There is no build step; the page runs in the browser.
+Visit `http://127.0.0.1:8080`. Use `npm start -- 9000` for another port. The server
+serves only the site's public files. Any static host can serve the same files;
+Node.js is only needed for the development tools.
 
 ## Cover loading
 
-Covers use the [Jikan v4 anime search API](https://docs.api.jikan.moe/).
-Only cards near the viewport request covers. Requests are serialized and spaced
-at least 1.1 seconds apart to respect Jikan's 3/second and 60/minute limits.
-Successfully loaded covers are cached in memory for the current page session.
+Covers come from the [AniList GraphQL API](https://docs.anilist.co/). Up to **ten
+title searches share one HTTP request**. Cards near the viewport load first, and
+verified cover URLs are cached in the browser for seven days, with a 500-entry
+limit. The site keeps working if browser storage is disabled or full.
 
-API requests time out after 10 seconds and image downloads after 15 seconds.
-Transient failures get up to two retries with increasing delays; a failed entry
-goes to the back of the queue. Rate limits respect `Retry-After` in seconds or
-HTTP-date form, with a fallback delay for missing or invalid headers. Empty
-search results and permanent HTTP errors show a fallback immediately. Use
-**Retry cover** to try again after a failure. Some entries may not exist in
-Jikan's catalogue, and cover availability also depends on Jikan and the image host.
+Requests are spaced at least 2.1 seconds apart to respect AniList's current
+30-request/minute limit. A full batch resolves ten titles rather than one, so
+the request limit does not mean only 30 covers per minute. Server rate-limit
+headers can slow requests further; exhausted quota and `Retry-After` cooldowns
+are honored. Actual speed depends on the provider, image downloads, and cache hits.
 
-Changing filters cancels pending requests and ignores callbacks from old cards.
-Search input is debounced to avoid restarting requests with every keystroke.
+The loader prefers exact titles and alternate names among search results. It
+handles partial GraphQL errors without discarding successful covers, aborts
+outdated requests after filter changes, and ignores stale callbacks. Requests
+time out after ten seconds and image downloads after fifteen seconds. Transient
+failures get up to two retries; **Retry cover** allows another attempt afterward.
+Entries absent from AniList show a fallback while the other covers continue loading.
 
-## Tests
+## Repository layout
 
-Requires Node.js 20 or newer. Install the development dependencies and Chromium:
+| File | Purpose |
+| --- | --- |
+| `index.html` / `styles.css` | Page structure and responsive styles |
+| `app.js` | Filters, rendering, and batched cover loading |
+| `data-vanilla.js` | Vanilla entries |
+| `data-neutral.js` | Neutral entries |
+| `data-avoid.js` | Avoid entries |
+| `scripts/` | Local preview, data validation, and optional live API check |
+| `tests/` | Browser regressions and repository-tool checks |
+
+## Development and validation
 
 ```sh
 npm ci
 npx playwright install chromium
+npm run check
 npm test
 ```
 
-If Chromium is already installed, use `BROWSER_PATH=/path/to/chromium npm test`.
-Minimal Linux systems may need `npx playwright install --with-deps chromium`
-instead. GitHub Actions uses Chrome already installed on its Ubuntu runner.
+`npm run check` checks application syntax and validates catalogue data, including
+duplicate titles, entry structure, tags, and scores. Browser tests cover filtering,
+accessibility controls, copying, mobile layout, batching, caching, cancellation,
+rate limits, partial results, and network/image failures. Normal tests use synthetic
+responses and do not contact external providers or load real catalogue covers.
 
-Tests run the real page in headless Chromium with synthetic entries and stubbed
-API/image responses. They cover filtering, reset, keyboard controls, clipboard
-fallbacks, literal text rendering, mobile layout, lazy loading, request cancellation,
-timeouts, rate limiting, malformed responses, and failed image downloads. They do
-not depend on Jikan being online or download real catalogue covers.
+If a browser is already installed, use
+`BROWSER_PATH=/path/to/chromium npm test`. On minimal Linux systems, Playwright may
+need `npx playwright install --with-deps chromium`. GitHub Actions uses Chrome
+already installed on its pinned Ubuntu runner.
+
+For an optional live check of the actual browser request and image-loading flow:
+
+```sh
+npm run test:live
+```
+
+This checks ten non-adult test titles in one real AniList request and verifies
+their cover images load. It needs network access and is kept separate from CI.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for catalogue edits and pull requests.
+
+## License and credits
+
+Source code is licensed under [0BSD](LICENSE). Cover metadata is supplied by
+[AniList](https://anilist.co/); external cover artwork belongs to its respective
+rights holders.
