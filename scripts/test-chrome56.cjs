@@ -71,16 +71,18 @@ async function main() {
     const site = createServer();
     const server = http.createServer(async (req, res) => {
         const pathname = new URL(req.url, 'http://localhost').pathname;
-        if (pathname === '/api' && req.method === 'POST') {
+        if (pathname.startsWith('/api/') && req.method === 'POST') {
             let body = '';
             for await (const chunk of req) body += chunk;
             const request = JSON.parse(body);
             const titles = Object.values(request.variables);
             state.requests.push(titles);
             res.on('close', () => { if (!res.writableEnded) state.aborted++; });
-            const data = Object.fromEntries(Object.entries(request.variables).map(([name, title]) => [name.replace('q', 'c'), {
-                media: title === 'Missing' ? [] : [{ title: { romaji: title }, coverImage: { large: pixel } }],
-            }]));
+            const data = Object.fromEntries(Object.entries(request.variables).map(([name, title]) => [name.replace('q', 'c'),
+                pathname === '/api/shikimori'
+                    ? (title === 'Missing' ? [] : [{ name: title, poster: { originalUrl: pixel } }])
+                    : { media: title === 'Missing' ? [] : [{ title: { romaji: title }, coverImage: { large: pixel } }] },
+            ]));
             const send = () => {
                 if (res.destroyed) return;
                 res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -101,7 +103,7 @@ async function main() {
                 var Native = window.XMLHttpRequest;
                 window.XMLHttpRequest = function () {
                     var xhr = new Native(); var open = xhr.open;
-                    xhr.open = function (method, url, async) { return open.call(xhr, method, url === 'https://graphql.anilist.co' ? '/api' : url, async); };
+                    xhr.open = function (method, url, async) { return open.call(xhr, method, url === 'https://graphql.anilist.co' ? '/api/anilist' : url === 'https://shikimori.io/api/graphql' ? '/api/shikimori' : url, async); };
                     return xhr;
                 };
                 window.fetch = function () { throw new Error('Use cancellable XHR on Chrome 56'); };
@@ -150,11 +152,12 @@ async function main() {
         const capabilities = await client.evaluate(`({ grid: CSS.supports('display', 'grid'), aspectRatio: CSS.supports('aspect-ratio', '1'), abort: typeof AbortController, finallyMethod: typeof Promise.prototype.finally })`);
         if (expected === 56) assert.deepEqual(capabilities, { grid: false, aspectRatio: false, abort: 'undefined', finallyMethod: 'undefined' });
         assert.equal(await client.evaluate('loader._normalizeTitle("東京々〆〇 café—❶")'), '東京々〆〇 café ❶');
-        await client.evaluate('ImageLoader.MIN_INTERVAL = 10; ImageLoader.ERROR_PAUSE = 10; ImageLoader.REQUEST_TIMEOUT = 2000; window.scrollTo(0, document.getElementById("anime-grid").offsetTop);');
+        await client.evaluate('ImageLoader.MIN_INTERVAL = 10; ImageLoader.SECONDARY_INTERVAL = 10; ImageLoader.ERROR_PAUSE = 10; ImageLoader.REQUEST_TIMEOUT = 2000; window.scrollTo(0, document.getElementById("anime-grid").offsetTop);');
         await until(() => client.evaluate('Array.from(document.querySelectorAll(".card-img")).some(function(img) { return img.naturalWidth > 0 && img.style.display === "block"; })'), 'XHR cover loading failed');
         assert.ok(state.requests.length > 0);
         assert.ok(state.requests.every(request => request.length <= 10));
-        console.log('PASS: script boot, native cancellable XHR, cover decoding and batched queries');
+        await until(() => client.evaluate('loader._states.every(function(state) { return state === "done"; })'), 'Offscreen covers did not finish passively');
+        console.log('PASS: script boot, both XHR providers, passive offscreen preloading and batched covers');
 
         await client.evaluate('document.querySelector(".advanced-toggle").click(); document.querySelector("[data-tag=Warm]").click(); document.querySelector("[data-tag=Shared]").click();');
         assert.equal(await client.evaluate('currentData.length'), 3);
@@ -207,7 +210,7 @@ async function main() {
         state.slow.add('Hung');
         await client.evaluate('ImageLoader.REQUEST_TIMEOUT = 100; currentData = [{title:"Hung", note:"", tags:[], score:5}]; renderCards(currentData);');
         await until(() => client.evaluate('loader._states[0] === "error"'), 'Hung XHR did not reach a bounded failure');
-        assert.equal(state.requests.filter(request => request.includes('Hung')).length, 3);
+        assert.equal(state.requests.filter(request => request.includes('Hung')).length, 6);
         assert.equal(await client.evaluate('document.querySelectorAll(".image-retry").length'), 1);
         assert.deepEqual(exceptions, []);
         console.log('PASS: real XHR cancellation, timeouts, bounded retries and no JavaScript exceptions');

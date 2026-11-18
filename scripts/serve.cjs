@@ -4,7 +4,7 @@ const path = require('node:path');
 
 const root = path.resolve(__dirname, '..');
 const files = new Set([
-    'index.html', 'app.js', 'styles.css', 'favicon.png',
+    'index.html', 'app.js', 'cover-search.js', 'styles.css', 'favicon.png',
     'data-vanilla.js', 'data-neutral.js', 'data-avoid.js',
 ]);
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png' };

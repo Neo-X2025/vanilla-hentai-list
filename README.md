@@ -23,7 +23,7 @@ The page supports **Chrome 56 and newer**, without a build step or downloaded
 polyfill service. Responsive cards use flex layout, margins, and padding-based
 cover sizing. The shipped scripts avoid newer syntax and DOM methods. Older
 Chrome uses cancellable XMLHttpRequest for covers, native clipboard copying,
-intersection ratios, and numeric scrolling; newer Chrome retains abortable Fetch
+and numeric scrolling; newer Chrome retains abortable Fetch
 and smooth scrolling. Keyboard focus outlines work on both.
 
 `npm run check` checks every shipped script, inline handler, linked/inline style,
@@ -34,23 +34,39 @@ visitors do not need it.
 
 ## Cover loading
 
-Covers come from the [AniList GraphQL API](https://docs.anilist.co/). Up to **ten
-title searches share one HTTP request**. Cards near the viewport load first, and
-verified cover URLs are cached in the browser for seven days, with a 500-entry
-limit. The site keeps working if browser storage is disabled or full.
+Covers use both [AniList](https://docs.anilist.co/) and
+[Shikimori](https://shikimori.io/api/doc/graphql). Each request batches up to **ten
+title searches**. The providers have independent queues and cooldowns, so one
+being slow, unavailable, or rate limited does not block the other.
 
-Requests are spaced at least 2.1 seconds apart to respect AniList's current
-30-request/minute limit. A full batch resolves ten titles rather than one, so
-the request limit does not mean only 30 covers per minute. Server rate-limit
-headers can slow requests further; exhausted quota and `Retry-After` cooldowns
-are honored. Actual speed depends on the provider, image downloads, and cache hits.
+Every card in the current results is queued immediately. Visible cards load first,
+then nearby cards, then the remaining cards in the background. Loading continues
+without scrolling or other interaction. Scrolling and resizing update priorities,
+and at most six image downloads run together. Filtering cancels outdated API and
+image requests before starting the new results.
 
-The loader prefers exact titles and alternate names among search results. It
-handles partial GraphQL errors without discarding successful covers, aborts
-outdated requests after filter changes, and ignores stale callbacks. Requests
-time out after ten seconds and image downloads after fifteen seconds. Transient
-failures get up to two retries; **Retry cover** allows another attempt afterward.
-Entries absent from AniList show a fallback while the other covers continue loading.
+Search checks original, English, native, and alternate titles. Up to three query
+variants handle punctuation, accents, and generic suffixes such as "The Animation".
+Matching rejects unrelated results and conflicting sequel numbers, and accounts
+for movie versus TV editions. It does not simply use the first search result.
+
+A poster is cached only after the browser successfully downloads and decodes it.
+Broken URLs and image timeouts trigger another poster size or the other provider;
+known failed URLs are remembered for 30 minutes. Repeated host failures temporarily
+favor other image hosts. Verified URLs stay cached for seven days, with a 500-entry
+limit. Storage being disabled or full does not stop loading.
+
+API requests are spaced at least 2.1 seconds apart for AniList and 750 milliseconds
+for Shikimori. Batching allows each request to resolve multiple covers. Each
+provider's rate-limit headers and `Retry-After` cooldowns can slow it further.
+API requests time out after ten seconds and image downloads after fifteen seconds.
+Transient API failures get up to two retries, and each card has a bounded image
+attempt budget. Partial GraphQL errors leave successful results intact.
+
+An unavailable or ambiguous catalogue entry can still have no usable poster. Its
+card explains the failure and offers **Retry cover**, while other cards keep
+loading. Manual retry also clears that card's failed-URL records so recovered
+images can be tried again.
 
 ## Repository layout
 
@@ -58,6 +74,7 @@ Entries absent from AniList show a fallback while the other covers continue load
 | --- | --- |
 | `index.html` / `styles.css` | Page structure and responsive styles |
 | `app.js` | Filters, rendering, and batched cover loading |
+| `cover-search.js` | Provider queries, title matching, and poster URL validation |
 | `data-vanilla.js` | Vanilla entries |
 | `data-neutral.js` | Neutral entries |
 | `data-avoid.js` | Avoid entries |
@@ -75,8 +92,9 @@ npm test
 
 `npm run check` checks browser compatibility and validates catalogue data, including
 duplicate titles, entry structure, tags, and scores. Browser tests cover filtering,
-accessibility controls, copying, mobile layout, batching, caching, cancellation,
-rate limits, partial results, and network/image failures. Normal tests use synthetic
+accessibility controls, copying, mobile layout, passive preloading, priority,
+provider failover, title matching, batching, caching, cancellation, rate limits,
+partial results, and network/image failures. Normal tests use synthetic
 responses and do not contact external providers or load real catalogue covers.
 
 If a browser is already installed, use
@@ -88,10 +106,13 @@ For an optional live check of the actual browser request and image-loading flow:
 
 ```sh
 npm run test:live
+npm run test:live -- --shikimori
 ```
 
-This checks ten non-adult test titles in one real AniList request and verifies
-their cover images load. It needs network access and is kept separate from CI.
+Each command checks ten non-adult test titles in one real request and verifies
+that all their images load without scrolling. The first isolates AniList; the
+second simulates an AniList outage and checks real Shikimori fallback and poster
+downloads. They need network access and are kept separate from CI.
 
 To run the archived-browser check locally on Linux x64 with Python 3, `dpkg-deb`,
 and Xvfb installed:
@@ -115,5 +136,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for catalogue edits and pull requests.
 ## License and credits
 
 Source code is licensed under [0BSD](LICENSE). Cover metadata is supplied by
-[AniList](https://anilist.co/); external cover artwork belongs to its respective
-rights holders.
+[AniList](https://anilist.co/) and [Shikimori](https://shikimori.io/); external cover
+artwork belongs to its respective rights holders.

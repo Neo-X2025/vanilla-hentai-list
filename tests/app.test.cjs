@@ -52,17 +52,22 @@ async function openPage(t, entries = fixtures, init) {
         window.fetchLog = [];
         window.respond = (variables, result) => new Response(JSON.stringify({
             data: Object.fromEntries(Object.entries(variables).map(([name, title]) => [name.replace('q', 'c'), {
-                media: result ? result(title) : [{ title: { romaji: title }, coverImage: { large: pixel } }],
+                media: result ? result(title).map(entry => Object.assign({ title: { romaji: title } }, entry)) : [{ title: { romaji: title }, coverImage: { large: pixel } }],
             }])),
+        }));
+        window.respondShikimori = (variables, result) => new Response(JSON.stringify({
+            data: Object.fromEntries(Object.entries(variables).map(([name, title]) => [name.replace('q', 'c'),
+                result ? result(title) : [{ name: title, poster: { originalUrl: pixel } }],
+            ])),
         }));
         window.setApiHandler = handler => {
             window.fetch = async (url, options) => {
                 const body = JSON.parse(options.body);
                 window.fetchLog.push({ url, ...body, headers: options.headers, time: Date.now() });
-                return handler(body.variables, options);
+                return handler(body.variables, options, url);
             };
         };
-        window.setApiHandler(variables => window.respond(variables));
+        window.setApiHandler((variables, options, url) => url.includes("shikimori") ? window.respondShikimori(variables) : window.respond(variables));
     }, { pixel });
     if (init) await context.addInitScript(init);
     const page = await context.newPage();
@@ -78,6 +83,10 @@ async function loaderPage(t, entries = fixtures) {
     await page.evaluate(() => {
         loader.reset([]);
         loader._cache.clear();
+        ImageLoader.SOURCES = ["anilist"];
+        ImageLoader.SECONDARY_INTERVAL = 10;
+        ImageLoader.SERVICE_PAUSE = 20;
+        ImageLoader.HOST_PAUSE = 20;
         ImageLoader.MIN_INTERVAL = 10;
         ImageLoader.ERROR_PAUSE = 10;
         ImageLoader.RATE_LIMIT_PAUSE = 10;
@@ -254,7 +263,7 @@ for (const failure of ['network', 'server', 'rate-limit', 'invalid-json', 'missi
         await loaded(page, 1);
         await page.waitForFunction(() => loader._states[0] === 'error', null, { timeout: 3000 });
         const attempts = await page.evaluate(() => fetchLog.filter(request => Object.values(request.variables).includes('First')).length);
-        assert.equal(attempts, failure === '404' ? 1 : 3);
+        assert.equal(attempts, ['404', 'broken-image'].includes(failure) ? 1 : 3);
         assert.equal(await page.locator('#card-0 .image-retry').count(), 1);
         assert.deepEqual(page.errors, []);
     });
@@ -267,7 +276,7 @@ test('partial GraphQL errors retry only failed aliases and preserve successful c
         const errors = [];
         for (const [key, title] of Object.entries(variables)) {
             const alias = key.replace('q', 'c');
-            data[alias] = title === 'First' ? null : { media: [{ coverImage: { large: testPixel } }] };
+            data[alias] = title === 'First' ? null : { media: [{ title: { romaji: title }, coverImage: { large: testPixel } }] };
             if (title === 'First') errors.push({ path: [alias], status: 500, message: 'Temporary failure' });
         }
         return new Response(JSON.stringify({ data, errors }));
@@ -433,14 +442,13 @@ test('rapid renders do not schedule duplicate batch requests', async t => {
     assert.equal(await page.evaluate(() => fetchLog.length), 1);
 });
 
-test('covers outside the viewport wait until scrolled near', async t => {
+test('covers outside the viewport load without scrolling', async t => {
     const page = await loaderPage(t);
     await render(page, Array.from({ length: 60 }, (_, i) => `Entry ${i}`));
     await loaded(page, 0);
-    const initially = await page.evaluate(() => fetchLog.flatMap(entry => Object.values(entry.variables)));
-    assert.ok(!initially.includes('Entry 59'));
-    await page.locator('#card-59').scrollIntoViewIfNeeded();
+    const before = await page.evaluate(() => window.scrollY);
     await loaded(page, 59);
+    assert.equal(await page.evaluate(() => window.scrollY), before);
 });
 
 test('real browser Fetch handles GraphQL POST and CORS', async t => {
@@ -458,7 +466,7 @@ test('real browser Fetch handles GraphQL POST and CORS', async t => {
         }
         const request = route.request().postDataJSON();
         requests.push(request);
-        const data = Object.fromEntries(Object.keys(request.variables).map(key => [key.replace('q', 'c'), { media: [{ coverImage: { large: pixel } }] }]));
+        const data = Object.fromEntries(Object.keys(request.variables).map(key => [key.replace('q', 'c'), { media: [{ title: { romaji: request.variables[key] }, coverImage: { large: pixel } }] }]));
         await route.fulfill({ contentType: 'application/json', headers, body: JSON.stringify({ data }) });
     });
     await page.evaluate(() => { window.fetch = window.nativeFetch; ImageLoader.REQUEST_TIMEOUT = 2000; });
@@ -479,7 +487,7 @@ test('a stalled image download times out without blocking its batch', async t =>
     await render(page);
     await loaded(page, 1);
     await page.waitForFunction(() => loader._states[0] === 'error', null, { timeout: 3000 });
-    assert.equal(await page.evaluate(() => fetchLog.filter(request => Object.values(request.variables).includes('First')).length), 3);
+    assert.equal(await page.evaluate(() => fetchLog.filter(request => Object.values(request.variables).includes('First')).length), 1);
     assert.equal(await page.locator('#card-0 .image-retry').count(), 1);
 });
 
@@ -588,4 +596,184 @@ test('the actual catalogue renders with valid scores, tags and no script errors'
     assert.equal(counts.rendered, counts.data);
     assert.equal(counts.invalid, 0);
     assert.deepEqual(page.errors, []);
+});
+
+test('an AniList outage falls back to a second working API', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        ImageLoader.SOURCES = ['anilist', 'shikimori'];
+        setApiHandler((variables, options, url) => url.includes('anilist') ? new Response('', { status: 503 }) : respondShikimori(variables));
+    });
+    await render(page);
+    await loaded(page, 0);
+    await loaded(page, 1);
+    const log = await page.evaluate(() => fetchLog);
+    assert.ok(log.some(request => request.url.includes('anilist')));
+    assert.ok(log.some(request => request.url.includes('shikimori')));
+    assert.equal(await page.evaluate(() => loader._cache.get('First').provider), 'shikimori');
+});
+
+test('one API rate limit does not pause the other API', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        ImageLoader.SOURCES = ['anilist', 'shikimori'];
+        setApiHandler((variables, options, url) => url.includes('anilist')
+            ? new Response('', { status: 429, headers: { 'Retry-After': '120' } }) : respondShikimori(variables));
+    });
+    await render(page);
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => fetchLog.filter(request => request.url.includes('anilist')).length), 1);
+    assert.equal(await page.evaluate(() => loader._cache.get('First').provider), 'shikimori');
+});
+
+test('broken poster sizes fall through without repeating the metadata lookup', async t => {
+    const page = await loaderPage(t);
+    let failedRequests = 0;
+    await page.route('https://covers.test/unavailable.jpg', route => { failedRequests++; return route.fulfill({ status: 404, body: 'missing' }); });
+    await page.evaluate(() => setApiHandler(variables => respond(variables, () => [{ coverImage: {
+        large: 'https://covers.test/unavailable.jpg', medium: testPixel,
+    } }])));
+    await render(page, ['Sized']);
+    await loaded(page, 0);
+    assert.equal(failedRequests, 1);
+    assert.equal(await page.evaluate(() => fetchLog.length), 1);
+    assert.equal(await page.locator('#img-0').getAttribute('src'), pixel);
+    assert.ok(await page.evaluate(() => JSON.parse(localStorage.getItem(ImageLoader.BAD_CACHE_KEY)).some(record => record[0] === 'https://covers.test/unavailable.jpg')));
+});
+
+test('unloadable images fall back to the other source and are skipped after filtering', async t => {
+    const page = await loaderPage(t);
+    let brokenDownloads = 0;
+    await page.route('https://covers.test/blocked.jpg', route => { brokenDownloads++; return route.fulfill({ status: 403, body: 'blocked' }); });
+    await page.evaluate(() => {
+        ImageLoader.SOURCES = ['anilist', 'shikimori'];
+        setApiHandler((variables, options, url) => url.includes('anilist')
+            ? respond(variables, () => [{ coverImage: { large: 'https://covers.test/blocked.jpg' } }]) : respondShikimori(variables));
+    });
+    await render(page, ['First']);
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => loader._cache.get('First').provider), 'shikimori');
+    await render(page, ['Second']);
+    await loaded(page, 0);
+    assert.equal(brokenDownloads, 1);
+    assert.equal(await page.evaluate(() => loader._cache.get('Second').provider), 'shikimori');
+});
+
+test('manual retry can download a previously failed URL after the host recovers', async t => {
+    const page = await loaderPage(t);
+    let recovered = false, downloads = 0;
+    await page.route('https://covers.test/recovered.png', route => {
+        downloads++;
+        return recovered
+            ? route.fulfill({ contentType: 'image/png', body: Buffer.from(pixel.split(',')[1], 'base64') })
+            : route.fulfill({ status: 404, body: 'missing' });
+    });
+    await page.evaluate(() => setApiHandler(variables => respond(variables, () => [{
+        coverImage: { large: 'https://covers.test/recovered.png' },
+    }])));
+    await render(page, ['Recovered']);
+    await page.waitForFunction(() => loader._states[0] === 'error');
+    assert.equal(downloads, 1);
+    recovered = true;
+    await page.locator('#card-0 .image-retry').click();
+    await loaded(page, 0);
+    assert.equal(downloads, 2);
+    assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem(ImageLoader.BAD_CACHE_KEY)).length), 0);
+});
+
+test('a paused image host does not hold up covers available from the other provider', async t => {
+    const page = await loaderPage(t);
+    let failures = 0;
+    await page.route('https://covers.test/outage/**', route => {
+        failures++;
+        return route.fulfill({ status: 403, body: 'blocked' });
+    });
+    await page.evaluate(() => {
+        ImageLoader.SOURCES = ['anilist', 'shikimori'];
+        ImageLoader.HOST_PAUSE = 120000;
+        setApiHandler((variables, options, url) => url.includes('anilist')
+            ? respond(variables, title => [{ coverImage: { large: `https://covers.test/outage/${encodeURIComponent(title)}.png` } }])
+            : respondShikimori(variables));
+    });
+    await render(page, Array.from({ length: 12 }, (_, i) => `Entry ${i}`));
+    await page.waitForFunction(() => loader._states.every(state => state === 'done'), null, { timeout: 3000 });
+    assert.ok(failures >= 3 && failures <= 8);
+    assert.equal(await page.evaluate(() => currentData.every(entry => loader._cache.get(entry.title).provider === 'shikimori')), true);
+});
+
+test('alternate title searches recover a generic animation suffix', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => setApiHandler(variables => respond(variables, title => title === 'Example'
+        ? [{ title: { romaji: 'Example' }, coverImage: { large: testPixel } }] : [])));
+    await render(page, ['Example The Animation']);
+    await loaded(page, 0);
+    const searches = await page.evaluate(() => fetchLog.flatMap(request => Object.values(request.variables)));
+    assert.ok(searches.includes('Example The Animation'));
+    assert.ok(searches.includes('Example'));
+    assert.ok(searches.length <= 3);
+});
+
+test('unrelated matches stay unavailable instead of displaying a random poster', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        ImageLoader.SOURCES = ['anilist', 'shikimori'];
+        setApiHandler((variables, options, url) => url.includes('anilist')
+            ? respond(variables, () => [{ title: { romaji: 'Unrelated Work' }, coverImage: { large: testPixel } }])
+            : respondShikimori(variables, () => [{ name: 'Also Unrelated', poster: { originalUrl: testPixel } }]));
+    });
+    await render(page, ['Requested']);
+    await page.waitForFunction(() => loader._states[0] === 'error');
+    assert.equal(await page.locator('#img-0').getAttribute('src'), null);
+    assert.equal(await page.evaluate(() => fetchLog.length), 2);
+});
+
+test('stationary background work starts with visible cards and finishes offscreen cards', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => {
+        currentData = Array.from({ length: 80 }, (_, i) => ({ title: `Entry ${i}`, note: '', tags: [], score: 5 }));
+        renderCards(currentData);
+        window.scrollTo(0, document.getElementById('card-50').offsetTop);
+    });
+    await loaded(page, 50);
+    const first = await page.evaluate(() => Object.values(fetchLog[0].variables));
+    assert.ok(first.includes('Entry 50'));
+    assert.ok(!first.includes('Entry 0'));
+    const scroll = await page.evaluate(() => window.scrollY);
+    await loaded(page, 79);
+    await loaded(page, 0);
+    assert.equal(await page.evaluate(() => window.scrollY), scroll);
+});
+
+test('scrolling reprioritizes queued covers ahead of distant background work', async t => {
+    const page = await loaderPage(t);
+    await page.evaluate(() => { ImageLoader.MIN_INTERVAL = 250; });
+    await render(page, Array.from({ length: 40 }, (_, i) => `Entry ${i}`));
+    await page.waitForFunction(() => fetchLog.length >= 1);
+    await page.evaluate(() => {
+        window.scrollTo(0, document.getElementById('card-39').offsetTop);
+        loader.reprioritize();
+    });
+    await page.waitForFunction(() => fetchLog.length >= 2);
+    assert.ok(await page.evaluate(() => Object.values(fetchLog[1].variables).includes('Entry 39')));
+});
+
+test('background downloads respect the concurrency cap', async t => {
+    const page = await loaderPage(t);
+    const held = [];
+    await page.route('https://covers.test/queued/**', route => { held.push(route); });
+    await page.evaluate(() => {
+        ImageLoader.IMAGE_TIMEOUT = 3000;
+        setApiHandler(variables => respond(variables, title => [{ coverImage: { large: `https://covers.test/queued/${encodeURIComponent(title)}.png` } }]));
+    });
+    await render(page, Array.from({ length: 12 }, (_, i) => `Entry ${i}`));
+    await page.waitForFunction(() => loader._activeImages.size === ImageLoader.IMAGE_CONCURRENCY);
+    for (let i = 0; i < 30 && held.length < 6; i++) await page.waitForTimeout(20);
+    assert.equal(held.length, 6);
+    const body = Buffer.from(pixel.split(',')[1], 'base64');
+    await Promise.all(held.slice(0, 6).map(route => route.fulfill({ contentType: 'image/png', body })));
+    await page.waitForFunction(() => Array.from(document.querySelectorAll('.card-img')).filter(img => img.naturalWidth > 0).length >= 6);
+    for (let i = 0; i < 30 && held.length < 12; i++) await page.waitForTimeout(20);
+    assert.equal(held.length, 12);
+    await Promise.all(held.slice(6).map(route => route.fulfill({ contentType: 'image/png', body })));
+    await loaded(page, 11);
 });

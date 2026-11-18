@@ -21,9 +21,10 @@ npm test
 
 If Chromium is installed already, set `BROWSER_PATH` when running tests. The
 automated suite uses synthetic API responses and does not contact cover providers.
-`npm run test:live` is a separate, optional check using ten non-adult test titles
-and the real AniList API and image host. It needs network access and can fail
-during a provider outage.
+`npm run test:live` and `npm run test:live -- --shikimori` are separate, optional
+checks using ten non-adult test titles and real API responses and poster downloads.
+They verify passive loading without scrolling; the Shikimori check also simulates
+an AniList outage. They need network access and can fail during a provider outage.
 
 ## Catalogue edits
 
@@ -49,8 +50,9 @@ flex gaps, or other features newer than this baseline. Keep fallbacks covered by
 tests. The archived-browser CI job runs Chromium 56 itself; setup and invocation
 are documented in the README.
 
-Add regression coverage for behavior changes, particularly request
-batching, cache invalidation, rate limits, and stale asynchronous callbacks.
+Add regression coverage for behavior changes, particularly passive preloading,
+viewport priority, provider failover, title matching, request batching, cache
+invalidation, rate limits, and stale asynchronous callbacks.
 Use synthetic entries in tests, and keep live-provider checks out of normal CI.
 
 Explain the problem, resulting behavior, and validation in the pull request.

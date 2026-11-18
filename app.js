@@ -9,7 +9,7 @@ const animeData = [
 
 // Chrome 56 has Fetch but no AbortController. Use XHR there so cancelling a
 // filter change or timing out a request still stops the underlying network I/O.
-function createCoverRequest(body) {
+function createCoverRequest(body, url = "https://graphql.anilist.co") {
     const native = typeof AbortController === "function" ? new AbortController() : null;
     const control = {
         signal: native ? native.signal : { aborted: false },
@@ -21,7 +21,7 @@ function createCoverRequest(body) {
         },
     };
     if (native && typeof fetch === "function") {
-        control.promise = Promise.resolve().then(() => fetch("https://graphql.anilist.co", {
+        control.promise = Promise.resolve().then(() => fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json", Accept: "application/json" },
             credentials: "omit",
@@ -32,7 +32,7 @@ function createCoverRequest(body) {
         control.promise = new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
             control.xhr = xhr;
-            xhr.open("POST", "https://graphql.anilist.co", true);
+            xhr.open("POST", url, true);
             xhr.setRequestHeader("Content-Type", "application/json");
             xhr.setRequestHeader("Accept", "application/json");
             xhr.onload = () => resolve({
@@ -63,167 +63,228 @@ function scrollToTop() {
 // IMAGE LOADER
 // =============================================================================
 class ImageLoader {
-
     constructor() {
         this._cache = new Map();
+        this._badURLs = new Map();
+        this._hosts = new Map();
+        this._providers = {};
+        Object.keys(CoverSearch.providers).forEach(name => {
+            this._providers[name] = { busy: false, controller: null, lastFetch: 0, pauseUntil: 0, interval: 0, failures: 0 };
+        });
         this._queue = [];
         this._states = [];
         this._data = [];
+        this._records = [];
         this._gen = 0;
-        this._inFlight = false;
-        this._lastFetch = 0;
-        this._pauseUntil = 0;
-        this._serverInterval = 0;
-        this._timer = null;
-        this._frame = null;
-        this._observer = null;
-        this._controller = null;
+        this._timer = this._frame = null;
         this._imageTimers = new Map();
+        this._activeImages = new Map();
         this._restoreCache();
     }
 
     reset(data) {
         this._gen++;
         clearTimeout(this._timer);
-        cancelAnimationFrame(this._frame);
-        if (this._controller) this._controller.abort();
-        if (this._observer) this._observer.disconnect();
-        for (const timer of this._imageTimers.values()) clearTimeout(timer);
+        clearTimeout(this._frame);
+        Object.values(this._providers).forEach(source => {
+            if (source.controller) source.controller.abort();
+            source.controller = null;
+            source.busy = false;
+        });
+        this._activeImages.forEach(image => {
+            image.onload = image.onerror = null;
+            image.removeAttribute("src");
+        });
+        this._imageTimers.forEach(timer => clearTimeout(timer));
         this._imageTimers.clear();
-        this._timer = this._frame = this._controller = this._observer = null;
-        this._inFlight = false;
+        this._activeImages.clear();
+        this._timer = this._frame = null;
         this._queue = [];
         this._data = data;
         this._states = data.map(() => "idle");
+        this._records = data.map(entry => this._newRecord(entry.title));
+    }
+
+    _newRecord(title) {
+        const tasks = [];
+        CoverSearch.queries(title).forEach(query => ImageLoader.SOURCES.forEach(provider => {
+            tasks.push({ provider, query, retries: 0, readyAt: 0, done: false });
+        }));
+        const cached = this._cache.get(title);
+        const image = cached && cached.expires > Date.now() ? { url: cached.url, provider: cached.provider || "cache" } : null;
+        if (!image) this._cache.delete(title);
+        return { tasks, images: image ? [image] : [], seen: new Set(image ? [image.url] : []), tried: new Set(), hadMatch: !!image, errors: 0 };
     }
 
     start() {
         const gen = this._gen;
-        this._frame = requestAnimationFrame(() => {
+        // A timer also runs when the tab is in the background. No viewport event
+        // or animation frame is required to start and finish preloading.
+        this._frame = setTimeout(() => {
             if (this._gen !== gen) return;
             this._frame = null;
-            if (typeof IntersectionObserver === "undefined") {
-                this._data.forEach((_, index) => this._enqueue(index));
-                this.reprioritize();
-                this._kick();
-                return;
-            }
-            const observer = new IntersectionObserver(entries => {
-                if (this._gen !== gen) return;
-                for (const entry of entries) {
-                    if (!isVisibleIntersection(entry)) continue;
-                    this._enqueue(Number(entry.target.dataset.index));
-                    observer.unobserve(entry.target);
-                }
-                this.reprioritize();
-                this._kick();
-            }, { rootMargin: "300px" });
-            this._observer = observer;
-            document.querySelectorAll(".card-img-container").forEach(el => observer.observe(el));
-        });
+            this._data.forEach((entry, index) => this._enqueue(index));
+            this.reprioritize();
+            this._kick();
+        }, 0);
     }
 
     _restoreCache() {
         try {
             const records = JSON.parse(localStorage.getItem(ImageLoader.CACHE_KEY));
-            if (!Array.isArray(records)) return;
-            for (const record of records.slice(-ImageLoader.CACHE_LIMIT)) {
-                if (!Array.isArray(record) || record.length !== 2) continue;
+            if (Array.isArray(records)) records.slice(-ImageLoader.CACHE_LIMIT).forEach(record => {
+                if (!Array.isArray(record) || record.length !== 2) return;
                 const [title, value] = record;
-                if (typeof title === "string" && value && typeof value.url === "string"
-                    && value.url.startsWith("https://") && Number.isFinite(value.expires)
-                    && value.expires > Date.now()) this._cache.set(title, value);
-            }
-        } catch (error) { /* Storage may be blocked, full, or contain invalid JSON. */ }
+                if (typeof title === "string" && value && typeof value.url === "string" && value.url.startsWith("https://")
+                    && Number.isFinite(value.expires) && value.expires > Date.now()) this._cache.set(title, value);
+            });
+        } catch (error) { /* Storage is optional. */ }
+        try {
+            const records = JSON.parse(localStorage.getItem(ImageLoader.BAD_CACHE_KEY));
+            if (Array.isArray(records)) records.slice(-ImageLoader.BAD_CACHE_LIMIT).forEach(record => {
+                if (Array.isArray(record) && typeof record[0] === "string" && Number.isFinite(record[1]) && record[1] > Date.now()) this._badURLs.set(record[0], record[1]);
+            });
+        } catch (error) { /* Bad cache data must not stop cover loading. */ }
     }
 
     _saveCache() {
         try {
-            localStorage.setItem(ImageLoader.CACHE_KEY, JSON.stringify(
-                [...this._cache].filter(([, value]) => value.url.startsWith("https://"))
-            ));
-        } catch (error) { /* In-memory caching still works when storage is unavailable. */ }
-    }
-
-    _cachedImage(title) {
-        const cached = this._cache.get(title);
-        if (cached && cached.expires > Date.now()) return cached.url;
-        this._cache.delete(title);
-        return null;
+            localStorage.setItem(ImageLoader.CACHE_KEY, JSON.stringify([...this._cache].filter(([, value]) => value.url.startsWith("https://"))));
+            localStorage.setItem(ImageLoader.BAD_CACHE_KEY, JSON.stringify([...this._badURLs].filter(([url, expires]) => url.startsWith("https://") && expires > Date.now())));
+        } catch (error) { /* In-memory caches work even when storage is blocked/full. */ }
     }
 
     _enqueue(index) {
         if (this._states[index] !== "idle") return;
-        const cached = this._cachedImage((this._data[index] || {}).title);
-        if (cached) {
-            this._applyImage(index, cached);
-            return;
-        }
+        this._queueRecord(index);
+    }
+
+    _queueRecord(index) {
         this._states[index] = "queued";
-        this._queue.push({ index, retries: 0 });
+        if (!this._queue.some(job => job.index === index)) this._queue.push({ index });
+        this._kick();
     }
 
     reprioritize() {
+        this._sortQueue();
+        this._kick();
+    }
+
+    _sortQueue() {
         const center = window.scrollY + window.innerHeight / 2;
-        this._queue.sort((a, b) => this._priorityScore(b.index, center) - this._priorityScore(a.index, center));
+        const scores = [];
+        this._queue.forEach(({ index }) => { scores[index] = this._priorityScore(index, center); });
+        this._queue.sort((a, b) => scores[b.index] - scores[a.index] || a.index - b.index);
     }
 
     _priorityScore(index, center) {
-        const el = document.getElementById(`card-${index}`);
-        if (!el) return -Infinity;
-        const rect = el.getBoundingClientRect();
-        const mid = rect.top + window.scrollY + rect.height / 2;
+        const card = document.getElementById(`card-${index}`);
+        if (!card) return -Infinity;
+        const rect = card.getBoundingClientRect();
         const visible = rect.bottom > 0 && rect.top < window.innerHeight;
-        return (visible ? 1e9 : 0) - Math.abs(mid - center);
+        const nearby = rect.bottom > -window.innerHeight && rect.top < window.innerHeight * 2;
+        return (visible ? 1e9 : nearby ? 1e8 : 0) - Math.abs(rect.top + window.scrollY + rect.height / 2 - center);
+    }
+
+    _host(url) {
+        try {
+            const name = new URL(url).hostname;
+            if (!name) return null;
+            if (!this._hosts.has(name)) this._hosts.set(name, { failures: 0, pauseUntil: 0 });
+            return this._hosts.get(name);
+        } catch (error) { return null; }
+    }
+
+    _bad(url) {
+        const expires = this._badURLs.get(url) || 0;
+        if (expires > Date.now()) return true;
+        this._badURLs.delete(url);
+        return false;
+    }
+
+    _images(record) {
+        return record.images.filter(image => !record.tried.has(image.url) && !this._bad(image.url));
+    }
+
+    _interval(provider) {
+        return Math.max(provider === "anilist" ? ImageLoader.MIN_INTERVAL : ImageLoader.SECONDARY_INTERVAL, this._providers[provider].interval);
+    }
+
+    _taskTime(task) {
+        const source = this._providers[task.provider];
+        return source.busy ? Infinity : Math.max(task.readyAt, source.pauseUntil, source.lastFetch + this._interval(task.provider));
     }
 
     _kick() {
-        if (!this._queue.length || this._timer !== null || this._inFlight) return;
-        const interval = Math.max(ImageLoader.MIN_INTERVAL, this._serverInterval);
-        const wait = Math.max(0, this._pauseUntil - Date.now(), this._lastFetch + interval - Date.now());
-        // Long server cooldowns must not overflow the browser's timer range.
-        this._timer = setTimeout(() => this._process(), Math.min(wait, 60000));
+        if (this._timer !== null || !this._queue.length) return;
+        let next = Infinity;
+        const now = Date.now();
+        this._queue.forEach(({ index }) => {
+            if (this._states[index] !== "queued") return;
+            const record = this._records[index];
+            const images = this._images(record);
+            if (record.tried.size < ImageLoader.MAX_IMAGE_ATTEMPTS) {
+                const ready = images.some(image => { const host = this._host(image.url); return !host || host.pauseUntil <= now; });
+                if (ready) {
+                    if (this._activeImages.size < ImageLoader.IMAGE_CONCURRENCY) next = now;
+                    return;
+                }
+                if (this._activeImages.size < ImageLoader.IMAGE_CONCURRENCY) images.forEach(image => {
+                    const host = this._host(image.url);
+                    next = Math.min(next, host ? host.pauseUntil : now);
+                });
+            }
+            record.tasks.filter(task => !task.done).forEach(task => { next = Math.min(next, this._taskTime(task)); });
+            if ((!images.length || record.tried.size >= ImageLoader.MAX_IMAGE_ATTEMPTS) && record.tasks.every(task => task.done)) next = now;
+        });
+        if (Number.isFinite(next)) this._timer = setTimeout(() => this._process(), Math.min(60000, Math.max(0, next - now)));
     }
 
     _process() {
         this._timer = null;
-        if (!this._queue.length) return;
-        const interval = Math.max(ImageLoader.MIN_INTERVAL, this._serverInterval);
-        if (Date.now() < Math.max(this._pauseUntil, this._lastFetch + interval)) {
-            this._kick();
-            return;
+        this._sortQueue();
+        const batches = {};
+        ImageLoader.SOURCES.forEach(provider => { batches[provider] = []; });
+        const now = Date.now();
+        for (const { index } of this._queue) {
+            if (this._states[index] !== "queued") continue;
+            const record = this._records[index];
+            if (record.tried.size >= ImageLoader.MAX_IMAGE_ATTEMPTS) { this._fail(index, "Cover could not be downloaded"); continue; }
+            const images = this._images(record);
+            const image = images.find(candidate => { const host = this._host(candidate.url); return !host || host.pauseUntil <= now; });
+            if (image) {
+                if (this._activeImages.size < ImageLoader.IMAGE_CONCURRENCY) this._applyImage(index, image);
+                continue;
+            }
+            const task = record.tasks.find(candidate => !candidate.done && this._taskTime(candidate) <= now && batches[candidate.provider].length < ImageLoader.BATCH_SIZE);
+            if (task) {
+                this._states[index] = "loading";
+                this._setSpinner(index, "Finding cover…");
+                batches[task.provider].push({ index, task, title: this._data[index].title });
+            } else if (!images.length && record.tasks.every(candidate => candidate.done)) {
+                this._fail(index, record.hadMatch ? "Cover could not be downloaded" : record.errors ? "Cover services unavailable" : "No cover found");
+            }
         }
-        const jobs = [];
-        while (this._queue.length && jobs.length < ImageLoader.BATCH_SIZE) {
-            const job = this._queue.shift();
-            if (this._states[job.index] !== "queued") continue;
-            const title = (this._data[job.index] || {}).title;
-            const cached = this._cachedImage(title);
-            if (cached) { this._applyImage(job.index, cached, job.retries); continue; }
-            const query = this._normalizeTitle(title || "");
-            if (!query) { this._fail(job.index, "No cover found"); continue; }
-            this._states[job.index] = "loading";
-            this._setSpinner(job.index, "Loading…");
-            jobs.push(Object.assign({}, job, { title, query }));
-        }
-        if (!jobs.length) { this._kick(); return; }
+        this._queue = this._queue.filter(job => this._states[job.index] === "queued");
         const gen = this._gen;
-        this._inFlight = true;
-        const finished = () => {
-            if (this._gen !== gen) return;
-            this._inFlight = false;
-            this._kick();
-        };
-        this._fetchBatch(jobs).catch(() => {
-            if (this._gen === gen) jobs.forEach(job => this._retry(job.index, job.retries, "Cover unavailable"));
-        }).then(finished, finished);
+        Object.keys(batches).forEach(provider => {
+            const jobs = batches[provider];
+            if (!jobs.length) return;
+            const source = this._providers[provider];
+            source.busy = true;
+            const finished = () => {
+                if (this._gen !== gen) return;
+                source.busy = false;
+                this._kick();
+            };
+            this._fetchBatch(provider, jobs, gen).catch(() => {
+                if (this._gen === gen) jobs.forEach(job => this._queryFailure(job, true));
+            }).then(finished, finished);
+        });
+        this._kick();
     }
 
-    _normalizeTitle(title) {
-        // Separate punctuation without Unicode property escapes (Chrome 64+).
-        // Keep accented, Japanese, and other non-ASCII title characters intact.
-        return title.normalize("NFKC").replace(/[\u0000-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u00BF\u2000-\u206F\u2600-\u2775\u2794-\u27BF\u3000-\u3004\u3008-\u3020\u302A-\u3030\u3036-\u3037\u303D-\u303F\u30FB]+/g, " ").replace(/\s+/g, " ").trim();
-    }
+    _normalizeTitle(title) { return CoverSearch.normalize(title); }
 
     _rateLimitDelay(headers) {
         const raw = (headers.get("Retry-After") || "").trim();
@@ -234,91 +295,66 @@ class ImageLoader {
         return delays.length ? Math.max(...delays) : ImageLoader.RATE_LIMIT_PAUSE;
     }
 
-    async _fetchBatch(jobs) {
-        const definitions = jobs.map((_, i) => `$q${i}: String`).join(", ");
-        const fields = jobs.map((_, i) => `
-            c${i}: Page(page: 1, perPage: 3) {
-                media(search: $q${i}, type: ANIME) {
-                    title { romaji english native }
-                    synonyms
-                    coverImage { large medium }
-                }
-            }`).join("\n");
-        const variables = {};
-        jobs.forEach((job, i) => { variables[`q${i}`] = job.query; });
-        const controller = createCoverRequest(JSON.stringify({ query: `query (${definitions}) { ${fields} }`, variables }));
-        const gen = this._gen;
-        this._controller = controller;
-        this._lastFetch = Date.now();
+    _queryFailure(job, transient, delay = ImageLoader.ERROR_PAUSE, skipProvider = false) {
+        const record = this._records[job.index];
+        record.errors++;
+        if (!transient || job.task.retries >= ImageLoader.MAX_RETRIES || skipProvider) {
+            record.tasks.forEach(task => { if (task.provider === job.task.provider) task.done = true; });
+        } else {
+            job.task.readyAt = Date.now() + delay * 2 ** job.task.retries;
+            job.task.retries++;
+        }
+        this._queueRecord(job.index);
+    }
+
+    async _fetchBatch(provider, jobs, gen) {
+        const source = this._providers[provider];
+        source.lastFetch = Date.now();
+        const controller = createCoverRequest(CoverSearch.request(provider, jobs), CoverSearch.providers[provider].url);
+        source.controller = controller;
         const timeout = setTimeout(() => controller.abort(), ImageLoader.REQUEST_TIMEOUT);
-        let response;
         try {
-            response = await controller.promise;
+            const response = await controller.promise;
             if (this._gen !== gen) return;
             const limit = Number(response.headers.get("X-RateLimit-Limit"));
-            if (Number.isFinite(limit) && limit >= 1) this._serverInterval = Math.ceil(60000 / limit) + 100;
-            if (response.headers.get("X-RateLimit-Remaining") === "0") {
-                this._pauseUntil = Math.max(this._pauseUntil, Date.now() + this._rateLimitDelay(response.headers));
-            }
-            if (response.status === 429) {
-                const delay = this._rateLimitDelay(response.headers);
-                jobs.forEach(job => this._retry(job.index, job.retries, "Rate limited", delay));
-                return;
+            if (Number.isFinite(limit) && limit >= 1) source.interval = Math.ceil(60000 / limit) + 100;
+            if (response.headers.get("X-RateLimit-Remaining") === "0" || response.status === 429) {
+                source.pauseUntil = Math.max(source.pauseUntil, Date.now() + this._rateLimitDelay(response.headers));
             }
             if (!response.ok) {
-                for (const job of jobs) {
-                    if (response.status >= 500 || response.status === 408) this._retry(job.index, job.retries, `Error ${response.status}`);
-                    else this._fail(job.index, `Cover unavailable (${response.status})`);
-                }
+                source.failures++;
+                if (source.failures >= 3 || response.status === 403) source.pauseUntil = Math.max(source.pauseUntil, Date.now() + ImageLoader.SERVICE_PAUSE);
+                jobs.forEach(job => this._queryFailure(job, response.status === 429 || response.status >= 500 || response.status === 408));
                 return;
             }
             const json = await response.json();
             if (this._gen !== gen) return;
-            const errors = json && Array.isArray(json.errors) ? json.errors : [];
-            jobs.forEach((job, i) => {
-                const alias = `c${i}`;
-                const error = errors.find(err => err && err.path && err.path[0] === alias) || errors.find(err => err && (!err.path || !err.path.length));
-                const media = json && json.data && json.data[alias] ? json.data[alias].media : null;
-                const candidates = Array.isArray(media) ? media : [];
-                const normalized = this._normalizeTitle(job.title).toLowerCase();
-                const exact = candidates.find(entry => [
-                    ...Object.values(entry && entry.title || {}), ...(entry && Array.isArray(entry.synonyms) ? entry.synonyms : [])
-                ].some(title => typeof title === "string" && this._normalizeTitle(title).toLowerCase() === normalized));
-                const candidate = exact || candidates[0];
-                const cover = candidate && candidate.coverImage;
-                const imageUrl = cover && (cover.large || cover.medium);
-                if (typeof imageUrl === "string" && imageUrl) {
-                    this._applyImage(job.index, imageUrl, job.retries);
-                } else if (error || !Array.isArray(media)) {
-                    const status = Number(error && (error.status || error.extensions && error.extensions.status));
-                    if (status === 429) this._retry(job.index, job.retries, "Rate limited", this._rateLimitDelay(response.headers));
-                    else if ([400, 401, 403, 404].includes(status)) this._fail(job.index, status === 404 ? "No cover found" : `Cover unavailable (${status})`);
-                    else this._retry(job.index, job.retries, "Bad response");
-                } else {
-                    this._fail(job.index, "No cover found");
+            source.failures = 0;
+            jobs.forEach((job, index) => {
+                const result = CoverSearch.result(provider, json, `c${index}`, job.title);
+                if (result.error) {
+                    const status = Number(result.error.status || (result.error.extensions || {}).status);
+                    if (status === 429) source.pauseUntil = Math.max(source.pauseUntil, Date.now() + this._rateLimitDelay(response.headers));
+                    this._queryFailure(job, ![400, 401, 403, 404].includes(status));
+                    return;
                 }
+                job.task.done = true;
+                const record = this._records[job.index];
+                record.hadMatch = record.hadMatch || result.matched;
+                result.images.forEach(image => {
+                    if (!record.seen.has(image.url)) { record.seen.add(image.url); record.images.push(image); }
+                });
+                this._queueRecord(job.index);
             });
         } catch (error) {
             if (this._gen !== gen) return;
-            const message = controller.signal.aborted ? "Request timed out" : response ? "Bad response" : "Network error";
-            jobs.forEach(job => this._retry(job.index, job.retries, message));
+            source.failures++;
+            if (source.failures >= 3) source.pauseUntil = Math.max(source.pauseUntil, Date.now() + ImageLoader.SERVICE_PAUSE);
+            jobs.forEach(job => this._queryFailure(job, true));
         } finally {
             clearTimeout(timeout);
-            if (this._controller === controller) this._controller = null;
+            if (source.controller === controller) source.controller = null;
         }
-    }
-
-    _retry(index, retries, message, delay = ImageLoader.ERROR_PAUSE * 2 ** retries) {
-        this._pauseUntil = Math.max(this._pauseUntil, Date.now() + delay);
-        if (retries >= ImageLoader.MAX_RETRIES) {
-            this._fail(index, message);
-            return;
-        }
-        this._setSpinner(index, `↻ ${message}`);
-        this._states[index] = "queued";
-        // A failing entry must not monopolize the front of the queue.
-        this._queue.push({ index, retries: retries + 1 });
-        this._kick();
     }
 
     _fail(index, message) {
@@ -334,74 +370,99 @@ class ImageLoader {
         button.onclick = event => {
             event.stopPropagation();
             if (this._gen !== gen || this._states[index] !== "error") return;
-            this._states[index] = "idle";
+            this._records[index].seen.forEach(url => {
+                this._badURLs.delete(url);
+                const host = this._host(url);
+                if (host) { host.failures = 0; host.pauseUntil = 0; }
+            });
+            this._saveCache();
+            this._records[index] = this._newRecord(this._data[index].title);
             this._setSpinner(index, "Waiting…");
-            this._enqueue(index);
-            this._kick();
+            this._queueRecord(index);
         };
         spinner.textContent = message;
         spinner.appendChild(button);
     }
 
     _setSpinner(index, text) {
-        const el = document.getElementById(`spinner-${index}`);
-        if (el) { el.textContent = text; el.style.display = "flex"; }
+        const spinner = document.getElementById(`spinner-${index}`);
+        if (spinner) { spinner.textContent = text; spinner.style.display = "flex"; }
     }
 
-    _applyImage(index, url, retries = 0) {
+    _applyImage(index, candidate) {
         const img = document.getElementById(`img-${index}`);
         const spinner = document.getElementById(`spinner-${index}`);
         if (!img || !spinner) { this._states[index] = "error"; return; }
         const gen = this._gen;
         const title = this._data[index].title;
+        const record = this._records[index];
+        record.tried.add(candidate.url);
+        this._states[index] = "loading";
+        this._activeImages.set(index, img);
         this._setSpinner(index, "Loading cover…");
         const cleanup = () => {
             clearTimeout(this._imageTimers.get(index));
             this._imageTimers.delete(index);
+            this._activeImages.delete(index);
             img.onload = img.onerror = null;
         };
         const failed = () => {
             if (this._gen !== gen) return;
             cleanup();
+            const host = this._host(candidate.url);
+            if (host && ++host.failures >= 3) host.pauseUntil = Date.now() + ImageLoader.HOST_PAUSE;
+            this._badURLs.set(candidate.url, Date.now() + ImageLoader.BAD_CACHE_TTL);
+            while (this._badURLs.size > ImageLoader.BAD_CACHE_LIMIT) this._badURLs.delete(this._badURLs.keys().next().value);
             this._cache.delete(title);
             this._saveCache();
             img.removeAttribute("src");
             img.style.display = "none";
-            this._retry(index, retries, "Cover failed to load");
+            this._setSpinner(index, "Trying another cover…");
+            this._queueRecord(index);
         };
         img.onload = () => {
             if (this._gen !== gen) return;
+            if (!img.naturalWidth) { failed(); return; }
             cleanup();
+            const host = this._host(candidate.url);
+            if (host) { host.failures = 0; host.pauseUntil = 0; }
             img.style.display = "block";
             spinner.style.display = "none";
             this._states[index] = "done";
-            // Cache only images the browser actually loaded successfully.
+            this._badURLs.delete(candidate.url);
             this._cache.delete(title);
-            this._cache.set(title, { url, expires: Date.now() + ImageLoader.CACHE_TTL });
+            this._cache.set(title, { url: candidate.url, provider: candidate.provider, expires: Date.now() + ImageLoader.CACHE_TTL });
             while (this._cache.size > ImageLoader.CACHE_LIMIT) this._cache.delete(this._cache.keys().next().value);
             this._saveCache();
             const container = img.closest(".card-img-container");
             if (container) container.style.backgroundColor = "transparent";
+            this._kick();
         };
         img.onerror = failed;
-        this._states[index] = "loading";
         this._imageTimers.set(index, setTimeout(failed, ImageLoader.IMAGE_TIMEOUT));
-        img.src = url;
+        img.src = candidate.url;
     }
 }
 
-// Ten searches share one request; stay below AniList's current 30 requests/minute.
-ImageLoader.MIN_INTERVAL = 2100;
+ImageLoader.SOURCES = ["anilist", "shikimori"];
+ImageLoader.MIN_INTERVAL = CoverSearch.providers.anilist.interval;
+ImageLoader.SECONDARY_INTERVAL = CoverSearch.providers.shikimori.interval;
 ImageLoader.BATCH_SIZE = 10;
 ImageLoader.RATE_LIMIT_PAUSE = 60000;
-ImageLoader.CACHE_KEY = 'vanilla-list:anilist-covers:v1';
+ImageLoader.SERVICE_PAUSE = 30000;
+ImageLoader.HOST_PAUSE = 30000;
+ImageLoader.IMAGE_CONCURRENCY = 6;
+ImageLoader.MAX_IMAGE_ATTEMPTS = 8;
+ImageLoader.CACHE_KEY = "vanilla-list:covers:v2";
 ImageLoader.CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
 ImageLoader.CACHE_LIMIT = 500;
+ImageLoader.BAD_CACHE_KEY = "vanilla-list:failed-covers:v1";
+ImageLoader.BAD_CACHE_TTL = 30 * 60 * 1000;
+ImageLoader.BAD_CACHE_LIMIT = 1000;
 ImageLoader.ERROR_PAUSE = 1000;
 ImageLoader.REQUEST_TIMEOUT = 10000;
 ImageLoader.IMAGE_TIMEOUT = 15000;
 ImageLoader.MAX_RETRIES = 2;
-
 
 const loader = new ImageLoader();
 let _scrollTimer;
@@ -409,6 +470,7 @@ window.addEventListener("scroll", () => {
     clearTimeout(_scrollTimer);
     _scrollTimer = setTimeout(() => loader.reprioritize(), 60);
 }, { passive: true });
+window.addEventListener("resize", () => loader.reprioritize());
 
 // =============================================================================
 // FILTER STATE
